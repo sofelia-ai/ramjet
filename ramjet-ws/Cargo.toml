@@ -1,0 +1,11 @@
+[package]
+name = "ramjet-ws"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sans-io WebSocket (RFC 6455) frame codec and upgrade handshake. No runtime, no I/O, no dependencies."
+repository = "https://github.com/sofelia-ai/ramjet"
+keywords = ["websocket", "rfc6455", "sans-io", "codec"]
+categories = ["network-programming", "parser-implementations"]
+
+[dependencies]

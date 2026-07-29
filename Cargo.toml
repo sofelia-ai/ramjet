@@ -1,0 +1,26 @@
+[package]
+name = "ramjet"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Thread-per-core, completion-based networking runtime. Standard wire, zero moving parts."
+repository = "https://github.com/sofelia-ai/ramjet"
+keywords = ["networking", "kqueue", "io-uring", "performance"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+libc = "0.2"
+
+# Examples only. The library stays decoupled from the codec: nothing under
+# src/ may depend on ramjet-ws, and ramjet-ws depends on nothing at all.
+[dev-dependencies]
+ramjet-ws = { path = "ramjet-ws" }
+# TLS for the wss_echo example only. `ring` rather than the default aws-lc-rs so
+# the examples build without a C toolchain, and no tls12: the point is a modern
+# handshake, and dropping it removes a pile of cipher-suite surface. Nothing
+# under src/ may reference these — `cargo tree` is the check.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2"
+
+[workspace]
+members = [".", "ramjet-ws"]
