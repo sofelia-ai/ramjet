@@ -50,7 +50,13 @@ jobs:
           # running slowly.
           - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-apple-darwin,       os: macos-13 }
+          # Both Mac targets build on Apple Silicon runners. macos-13 (Intel)
+          # runners are scarce and being retired — a release once sat queued
+          # 11 minutes waiting for one while every other target finished in
+          # under a minute. Rosetta 2 on the arm64 runners executes the
+          # x86_64 test binaries, so this target is still tested, not just
+          # cross-compiled and hoped about.
+          - { target: x86_64-apple-darwin,       os: macos-latest }
           - { target: aarch64-apple-darwin,      os: macos-latest }
     steps:
       - uses: actions/checkout@v4
@@ -59,9 +65,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      # Tests run natively; a target that cannot pass its own suite has no
-      # business being released.
-      - run: cargo test --workspace --all-targets
+      # Every row tests exactly what it ships — natively, or under Rosetta for
+      # x86_64 macOS. A target that cannot pass its own suite is not released.
+      - run: cargo test --workspace --all-targets --target ${{ matrix.target }}
 
       - name: Build
         run: |
