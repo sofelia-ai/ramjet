@@ -1,0 +1,15 @@
+{
+    "outdir": "/reports",
+
+    "servers": [
+        {
+            "agent": "ramjet-wss",
+            "url": "wss://127.0.0.1:9002",
+            "options": {"version": 18}
+        }
+    ],
+
+    "cases": ["*"],
+    "exclude-cases": [],
+    "exclude-agent-cases": {}
+}

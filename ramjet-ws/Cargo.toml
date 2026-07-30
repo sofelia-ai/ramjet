@@ -7,5 +7,7 @@ description = "Sans-io WebSocket (RFC 6455) frame codec and upgrade handshake. N
 repository = "https://github.com/sofelia-ai/ramjet"
 keywords = ["websocket", "rfc6455", "sans-io", "codec"]
 categories = ["network-programming", "parser-implementations"]
+readme = "README.md"
+rust-version = "1.85"
 
 [dependencies]

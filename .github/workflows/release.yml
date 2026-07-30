@@ -1,0 +1,131 @@
+name: Release
+
+# Tag-driven: `git tag v0.1.0 && git push --tags` builds every target,
+# attaches the binaries to a GitHub Release, and publishes the crates.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run; nothing is published)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag that disagrees with Cargo.toml ships binaries whose --version lies.
+  # Cheaper to fail here than to yank a release.
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          [ -n "${{ inputs.tag }}" ] && TAG="${{ inputs.tag }}"
+          TAG="${TAG#v}"
+          CRATE=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          WS=$(grep -m1 '^version' ramjet-ws/Cargo.toml | cut -d'"' -f2)
+          echo "tag=$TAG crate=$CRATE ramjet-ws=$WS"
+          if [ "$TAG" != "$CRATE" ] || [ "$TAG" != "$WS" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml ($CRATE) / ramjet-ws ($WS)"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No Windows target: the reactor has io_uring and kqueue backends,
+          # and no IOCP one, so Windows does not compile rather than merely
+          # running slowly.
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin,       os: macos-13 }
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # Tests run natively; a target that cannot pass its own suite has no
+      # business being released.
+      - run: cargo test --workspace --all-targets
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bins --example echo --example ws_echo --example wss_echo --example echo_mt
+
+      - name: Package
+        run: |
+          V="${{ needs.check-version.outputs.version }}"
+          DIR="ramjet-$V-${{ matrix.target }}"
+          mkdir -p "$DIR"
+          B="target/${{ matrix.target }}/release"
+          cp "$B/bench" "$B/ws_bench" "$DIR/"
+          cp "$B/examples/echo" "$B/examples/ws_echo" \
+             "$B/examples/wss_echo" "$B/examples/echo_mt" "$DIR/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$DIR/"
+          tar czf "$DIR.tar.gz" "$DIR"
+          shasum -a 256 "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+          ls -la "$DIR.tar.gz"*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ramjet-${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  release:
+    needs: [check-version, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - run: ls -la dist/
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.sha256 \
+            --title "ramjet ${GITHUB_REF_NAME}" \
+            --notes "Binaries for Linux and macOS on x86_64 and arm64. Verify with the .sha256 files.
+
+          See BENCHMARKS.md for measured performance and CONFORMANCE.md for the Autobahn and browser receipts." \
+            --verify-tag
+
+  publish-crates:
+    needs: [check-version, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish to crates.io
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::CARGO_REGISTRY_TOKEN not set — skipping crates.io publish"
+            exit 0
+          fi
+          # ramjet-ws first: it stands alone and ramjet's examples use it.
+          cargo publish -p ramjet-ws --token "$TOKEN"
+          cargo publish -p ramjet --token "$TOKEN"

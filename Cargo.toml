@@ -7,6 +7,11 @@ description = "Thread-per-core, completion-based networking runtime. Standard wi
 repository = "https://github.com/sofelia-ai/ramjet"
 keywords = ["networking", "kqueue", "io-uring", "performance"]
 categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+rust-version = "1.85"
+# The published crate is the library and its examples. Benchmark rigs,
+# competitor sources and conformance configs stay in the repo.
+exclude = ["bench/", "autobahn/", "scripts/linux.sh", ".github/"]
 
 [dependencies]
 libc = "0.2"

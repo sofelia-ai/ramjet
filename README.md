@@ -35,6 +35,22 @@ today you drive the reactor directly, as the examples do. If you want a
 | Thread-per-core | example only, scaling unproven |
 | HTTP/1.1, QUIC | not started |
 
+## Install
+
+As a library:
+
+```toml
+[dependencies]
+ramjet    = "0.1"      # the runtime (low-level: you drive the reactor)
+ramjet-ws = "0.1"      # just the WebSocket codec — no deps, no I/O, standalone
+```
+
+Prebuilt binaries for Linux and macOS on x86_64 and arm64 are attached to each
+[release](https://github.com/sofelia-ai/ramjet/releases), with `.sha256` files
+beside them. There is no Windows build: the reactor has io_uring and kqueue
+backends and no IOCP one, so Windows does not compile rather than merely
+running slowly.
+
 ## Try it
 
 ```sh
