@@ -51,7 +51,81 @@ beside them. There is no Windows build: the reactor has io_uring and kqueue
 backends and no IOCP one, so Windows does not compile rather than merely
 running slowly.
 
-## Try it
+## Use it
+
+An echo server, complete. This is the whole API surface you need:
+
+```rust
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::{IntoRawFd, RawFd};
+
+use ramjet::net::Listener;
+use ramjet::reactor::{Driver, Op, PlatformDriver};
+
+// A completion carries back whatever `user` tag its submission had, so an op
+// routes itself. Pack the kind and the fd into those 64 bits — no lookup table.
+const ACCEPT: u64 = 0;
+const READ: u64 = 1;
+const WRITE: u64 = 2;
+
+fn tag(kind: u64, fd: RawFd) -> u64 {
+    (kind << 32) | (fd as u32 as u64)
+}
+
+fn main() -> io::Result<()> {
+    let listener = Listener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 9000)))?;
+    let lfd = listener.into_raw_fd();
+
+    let mut d = PlatformDriver::new()?;
+    d.submit_with(Op::Accept { fd: lfd }, tag(ACCEPT, lfd))?;
+
+    let mut done = Vec::new();
+    loop {
+        d.wait(&mut done)?;              // blocks until something finishes
+        if done.is_empty() {
+            return Ok(());               // nothing in flight
+        }
+
+        for c in done.drain(..) {
+            let kind = c.user >> 32;
+            let fd = c.user as u32 as RawFd;
+
+            match (kind, c.result) {
+                (ACCEPT, Ok(conn)) => {
+                    let conn = conn as RawFd;
+                    d.submit_with(Op::Accept { fd: lfd }, tag(ACCEPT, lfd))?;
+                    // Pooled: this connection owns no buffer while it waits.
+                    d.submit_with(Op::ReadPooled { fd: conn }, tag(READ, conn))?;
+                }
+                (READ, Ok(n)) if n > 0 => {
+                    // A pooled read returns its buffer trimmed to the bytes
+                    // read, so `buf` *is* the data.
+                    let buf = c.buf.expect("pooled read returns its buffer");
+                    d.submit_with(Op::Write { fd, buf }, tag(WRITE, fd))?;
+                }
+                (WRITE, Ok(_)) => {
+                    if let Some(buf) = c.buf {
+                        d.recycle(buf);  // back to the pool
+                    }
+                    d.submit_with(Op::ReadPooled { fd }, tag(READ, fd))?;
+                }
+                _ => {
+                    d.submit(Op::Close { fd })?;   // EOF or a dead peer
+                }
+            }
+        }
+    }
+}
+```
+
+`nc 127.0.0.1 9000` will echo. That same loop shape drives the WebSocket and
+TLS examples — only the handling of a completed read changes.
+
+For WebSocket framing, [`ramjet-ws`](ramjet-ws/) is a separate crate with no
+dependencies and no knowledge of this runtime; use it with tokio if you like.
+
+## Run the examples
 
 ```sh
 cargo run --release --example echo 9000        # TCP echo
