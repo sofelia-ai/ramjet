@@ -2296,9 +2296,10 @@ impl Drop for UringDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::unix::net::UnixStream;
 
     /// Resident set size in bytes, from `/proc/self/statm` field 2 (pages).
     fn rss_bytes() -> usize {
@@ -2469,9 +2470,9 @@ mod tests {
     #[test]
     fn unclaimed_ready_accept_is_closed_with_driver() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        // SAFETY: dup creates an independently owned descriptor on success.
-        let accepted = unsafe { libc::dup(listener.as_raw_fd()) };
-        assert!(accepted >= 0, "dup: {}", io::Error::last_os_error());
+        let (mut witness, accepted) = UnixStream::pair().expect("socket pair");
+        witness.set_nonblocking(true).expect("nonblocking witness");
+        let accepted = accepted.into_raw_fd();
         let mut d = UringDriver::new().expect("ring");
         d.fd_state(listener.as_raw_fd())
             .accepted
@@ -2484,10 +2485,16 @@ mod tests {
         assert_eq!(d.ready_accepted, [accepted]);
         drop(d);
 
-        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        // EOF proves that the underlying socket description lost its final
+        // peer. Checking `fcntl(accepted, F_GETFD)` instead is racy: another
+        // parallel test can reuse that numeric descriptor immediately after
+        // Drop closes it and make a correct close look like a leak.
+        let mut byte = [0u8; 1];
         assert_eq!(
-            unsafe { libc::fcntl(accepted, libc::F_GETFD) },
-            -1,
+            witness
+                .read(&mut byte)
+                .expect("a leaked peer would return WouldBlock"),
+            0,
             "Drop must close an Accept result that wait never handed off"
         );
     }
@@ -2495,9 +2502,9 @@ mod tests {
     #[test]
     fn successful_doomed_accept_is_closed() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        // SAFETY: dup creates an independently owned descriptor on success.
-        let accepted = unsafe { libc::dup(listener.as_raw_fd()) };
-        assert!(accepted >= 0, "dup: {}", io::Error::last_os_error());
+        let (mut witness, accepted) = UnixStream::pair().expect("socket pair");
+        witness.set_nonblocking(true).expect("nonblocking witness");
+        let accepted = accepted.into_raw_fd();
         let mut d = UringDriver::new().expect("ring");
         let id = d.ops.reserve(0);
         d.ops.put_op(
@@ -2511,10 +2518,12 @@ mod tests {
 
         d.complete(id, accepted, 0);
 
-        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        let mut byte = [0u8; 1];
         assert_eq!(
-            unsafe { libc::fcntl(accepted, libc::F_GETFD) },
-            -1,
+            witness
+                .read(&mut byte)
+                .expect("a leaked peer would return WouldBlock"),
+            0,
             "an accept that beats cancellation must not leak its fd"
         );
         assert_eq!(

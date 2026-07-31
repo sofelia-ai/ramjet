@@ -80,7 +80,7 @@ jobs:
           DIR="ramjet-$V-${{ matrix.target }}"
           mkdir -p "$DIR"
           B="target/${{ matrix.target }}/release"
-          cp "$B/bench" "$B/ws_bench" "$DIR/"
+          cp "$B/connect_bench" "$B/ws_bench" "$DIR/"
           cp "$B/examples/echo" "$B/examples/ws_echo" \
              "$B/examples/wss_echo" "$B/examples/echo_mt" "$DIR/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$DIR/"
