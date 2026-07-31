@@ -127,18 +127,10 @@ fn cork_batch(conn: &mut Conn, buf: &mut Vec<u8>) -> bool {
     let mut written = 0usize;
     let mut from = 0usize;
     loop {
-        match conn.decoder.take_frame_at(buf, from) {
+        match conn.decoder.take_echo_frame_at(buf, from, written) {
             Ok(Some(view)) => {
-                let (header, n) = reply_header(view.kind, view.payload.len());
-                assert!(
-                    written + n <= view.payload.start,
-                    "reply {written}+{n} would overwrite a payload starting at {}",
-                    view.payload.start,
-                );
-                buf[written..written + n].copy_from_slice(&header[..n]);
-                buf.copy_within(view.payload.clone(), written + n);
-                written += n + view.payload.len();
-                from = view.payload.end;
+                written = view.frame.end;
+                from = view.consumed;
             }
             Ok(None) => break,
             Err(e) => {

@@ -1,45 +1,81 @@
-// Single-threaded echo server on the ramjet reactor. Usage: `echo [PORT]`.
+// Single-threaded echo server on the ramjet reactor.
+// Usage: `echo [PORT] [BIND_IP]`.
 // Plain `//` and not `//!`: tests/echo.rs include!s this file into a module,
 // where an inner doc comment is not a legal item.
 
-use std::collections::HashMap;
 use std::env;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{IntoRawFd, RawFd};
 
 use ramjet::net::Listener;
 use ramjet::reactor::PlatformDriver;
-use ramjet::reactor::{Driver, Op, OpId};
+use ramjet::reactor::{Driver, Op};
 
 fn main() -> io::Result<()> {
-    let port: u16 = env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
+    let mut args = env::args().skip(1);
+    let port = args
+        .next()
+        .map(|value| {
+            value.parse::<u16>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid port: {value}"),
+                )
+            })
+        })
+        .transpose()?
         .unwrap_or(9000);
+    let bind_ip = args
+        .next()
+        .map(|value| {
+            value.parse::<IpAddr>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid bind IP: {value}"),
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    if let Some(extra) = args.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected argument: {extra}"),
+        ));
+    }
     // ramjet's own socket, not std's: already non-blocking, as the driver needs.
-    let listener = Listener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?;
-    println!(
-        "ramjet echo listening on 127.0.0.1:{}",
-        listener.local_addr().port()
-    );
+    let listener = Listener::bind(SocketAddr::new(bind_ip, port))?;
+    println!("ramjet echo listening on {}", listener.local_addr());
     serve(listener.into_raw_fd())
 }
 
-/// What an op was, so its completion can be routed — a `Completion` carries only an id.
-enum Job {
-    Accept,
-    Read(RawFd),
-    Write(RawFd),
+// The kernel already carries 64 bits of application data beside every
+// completion. Keep the operation kind in the high half and the descriptor in
+// the low half, so routing is two shifts instead of a hash-table lookup.
+const KIND_ACCEPT: u64 = 0;
+const KIND_READ: u64 = 1;
+const KIND_WRITE: u64 = 2;
+const KIND_CLOSE: u64 = 3;
+
+fn tag(kind: u64, fd: RawFd) -> u64 {
+    (kind << 32) | u64::from(fd as u32)
+}
+
+fn tag_kind(user: u64) -> u64 {
+    user >> 32
+}
+
+fn tag_fd(user: u64) -> RawFd {
+    (user & 0xFFFF_FFFF) as u32 as RawFd
 }
 
 /// Echo loop over `listener`. Only returns if the driver itself fails.
 pub fn serve(listener: RawFd) -> io::Result<()> {
     let mut d = PlatformDriver::new()?;
-    let mut jobs: HashMap<OpId, Job> = HashMap::new();
     let mut done = Vec::new();
 
-    jobs.insert(d.submit(Op::Accept { fd: listener })?, Job::Accept);
+    d.submit_with(Op::Accept { fd: listener }, tag(KIND_ACCEPT, listener))?;
 
     loop {
         d.wait(&mut done)?;
@@ -47,14 +83,17 @@ pub fn serve(listener: RawFd) -> io::Result<()> {
             return Ok(()); // nothing in flight; waiting again would just spin
         }
         for c in done.drain(..) {
-            match jobs.remove(&c.id) {
-                Some(Job::Accept) => match c.result {
+            let kind = tag_kind(c.user);
+            let fd = tag_fd(c.user);
+
+            match kind {
+                KIND_ACCEPT => match c.result {
                     Ok(fd) => {
                         let fd = fd as RawFd;
-                        jobs.insert(d.submit(Op::Accept { fd: listener })?, Job::Accept);
+                        d.submit_with(Op::Accept { fd: listener }, tag(KIND_ACCEPT, listener))?;
                         // Pooled: this connection holds no read buffer until it
                         // actually has something to read.
-                        jobs.insert(d.submit(Op::ReadPooled { fd })?, Job::Read(fd));
+                        d.submit_with(Op::ReadPooled { fd }, tag(KIND_READ, fd))?;
                     }
                     // The pending connection died before we could take it, which
                     // says nothing about the listener. macOS reports this as
@@ -68,19 +107,19 @@ pub fn serve(listener: RawFd) -> io::Result<()> {
                             )
                         ) =>
                     {
-                        jobs.insert(d.submit(Op::Accept { fd: listener })?, Job::Accept);
+                        d.submit_with(Op::Accept { fd: listener }, tag(KIND_ACCEPT, listener))?;
                     }
                     // Anything else means the listener itself is unusable. EBADF
                     // and friends fail identically forever, so resubmitting
                     // would spin this loop at 100% CPU; fail loudly instead.
                     Err(e) => return Err(e),
                 },
-                Some(Job::Read(fd)) => match (c.result, c.buf) {
+                KIND_READ => match (c.result, c.buf) {
                     // A pooled buffer arrives trimmed to the bytes read, so it
                     // goes into the Write whole, and comes back on its
                     // completion.
                     (Ok(n), Some(buf)) if n > 0 => {
-                        jobs.insert(d.submit(Op::Write { fd, buf })?, Job::Write(fd));
+                        d.submit_with(Op::Write { fd, buf }, tag(KIND_WRITE, fd))?;
                     }
                     // A Close already retired this fd and cancelled the read.
                     // Closing again would hit whatever has reused the number.
@@ -90,25 +129,30 @@ pub fn serve(listener: RawFd) -> io::Result<()> {
                         if let Some(buf) = buf {
                             d.recycle(buf);
                         }
-                        d.submit(Op::Close { fd })?;
+                        d.submit_with(Op::Close { fd }, tag(KIND_CLOSE, fd))?;
                     }
                 },
-                Some(Job::Write(fd)) => match (c.result, c.buf) {
+                KIND_WRITE => match (c.result, c.buf) {
                     (Ok(_), buf) => {
                         if let Some(buf) = buf {
                             d.recycle(buf);
                         }
-                        jobs.insert(d.submit(Op::ReadPooled { fd })?, Job::Read(fd));
+                        d.submit_with(Op::ReadPooled { fd }, tag(KIND_READ, fd))?;
                     }
                     (Err(_), buf) => {
                         if let Some(buf) = buf {
                             d.recycle(buf);
                         }
-                        d.submit(Op::Close { fd })?;
+                        d.submit_with(Op::Close { fd }, tag(KIND_CLOSE, fd))?;
                     }
                 },
-                // Close completions carry no job.
-                None => {}
+                KIND_CLOSE => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("completion carried unknown operation tag {kind}"),
+                    ));
+                }
             }
         }
     }

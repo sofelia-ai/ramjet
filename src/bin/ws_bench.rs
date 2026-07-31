@@ -1,18 +1,18 @@
 //! std-only WebSocket echo benchmark client.
 //!
-//! The same shape as `bench`: one thread per connection, a barrier so the clock
-//! starts only once every connection is up, then each worker keeps up to
-//! `--pipeline` frames in flight until the deadline, draining whatever is
-//! still outstanding afterward. The difference is what goes over the wire —
-//! an RFC 6455 upgrade, then masked binary frames.
+//! One thread is used per connection, with a barrier so the clock starts only
+//! once every connection is up. Each worker then keeps up to `--pipeline`
+//! frames in flight until the deadline and drains anything still outstanding
+//! afterward. The wire protocol is an RFC 6455 upgrade followed by masked
+//! binary frames.
 //!
 //! Framing is hand-rolled here rather than taken from `ramjet-ws`. A `src/bin`
 //! target compiles against `[dependencies]`, and the codec is deliberately only
 //! a `[dev-dependencies]` entry so the library stays decoupled from it; pulling
 //! it in for this would drag it into every normal build. Eighty lines of
-//! framing is the cheaper trade, and it keeps the tool std-only like `bench`.
+//! framing is the cheaper trade and keeps the tool std-only.
 //!
-//! Usage: ws_bench <addr> [--conns N] [--size BYTES] [--secs S] [--pipeline K]
+//! Usage: ws_bench <addr> [--conns N] [--size BYTES] [--secs S] [--pipeline K] [--burst]
 
 use std::collections::VecDeque;
 use std::env;
@@ -41,6 +41,7 @@ struct Config {
     size: usize,
     secs: u64,
     pipeline: usize,
+    burst: bool,
 }
 
 impl Default for Config {
@@ -51,18 +52,22 @@ impl Default for Config {
             size: 64,
             secs: 10,
             pipeline: 1,
+            burst: false,
         }
     }
 }
 
 fn print_usage() {
-    eprintln!("Usage: ws_bench <addr> [--conns N] [--size BYTES] [--secs S] [--pipeline K]");
+    eprintln!(
+        "Usage: ws_bench <addr> [--conns N] [--size BYTES] [--secs S] [--pipeline K] [--burst]"
+    );
     eprintln!();
     eprintln!("  addr           target address (default 127.0.0.1:9001)");
     eprintln!("  --conns N      number of concurrent connections (default 50)");
     eprintln!("  --size BYTES   payload size in bytes (default 64)");
     eprintln!("  --secs S       duration in seconds (default 10)");
     eprintln!("  --pipeline K   frames kept in flight per connection (default 1)");
+    eprintln!("  --burst        write each pipeline as one batch, then drain it");
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -96,6 +101,7 @@ fn parse_args() -> Result<Config, String> {
                     .parse()
                     .map_err(|_| format!("invalid --pipeline value: {v}"))?;
             }
+            "--burst" => cfg.burst = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -258,6 +264,32 @@ fn read_frame(ws: &mut Ws, buf: &mut Vec<u8>) -> std::io::Result<u8> {
     Ok(opcode)
 }
 
+/// Read and validate one echo. Checking every payload byte keeps a broken or
+/// non-echoing implementation from winning by returning the right frame shape.
+#[inline]
+fn read_verified_echo(ws: &mut Ws, echo: &mut Vec<u8>, expected: &[u8]) -> Result<(), String> {
+    match read_frame(ws, echo) {
+        Ok(OP_BINARY) if echo == expected => Ok(()),
+        Ok(OP_BINARY) if echo.len() == expected.len() => {
+            let first = echo
+                .iter()
+                .zip(expected)
+                .position(|(actual, wanted)| actual != wanted)
+                .unwrap_or(0);
+            Err(format!(
+                "binary echo payload differed at byte {first}: got {:#04x}, expected {:#04x}",
+                echo[first], expected[first]
+            ))
+        }
+        Ok(opcode) => Err(format!(
+            "expected a {}-byte binary echo, got opcode {opcode:#x} of {} bytes",
+            expected.len(),
+            echo.len()
+        )),
+        Err(e) => Err(format!("read failed: {e}")),
+    }
+}
+
 /// Round-trip latencies (nanoseconds) plus an error, if the connection
 /// dropped out partway through. Latencies collected before the error are
 /// kept, not discarded.
@@ -280,6 +312,7 @@ fn worker(
     size: usize,
     secs: u64,
     pipeline: usize,
+    burst: bool,
     barrier: &Barrier,
 ) -> WorkerResult {
     macro_rules! give_up {
@@ -324,6 +357,46 @@ fn worker(
     barrier.wait();
     let deadline = Instant::now() + Duration::from_secs(secs);
 
+    if burst {
+        // A sliding pipeline still performs one client write syscall per
+        // message. That can cap a same-host benchmark before the server is
+        // busy. Burst mode keeps the same maximum number of in-flight frames,
+        // but emits them in one write and drains the whole burst before the
+        // next. Both servers therefore receive the exact same TCP byte stream
+        // while the load generator spends much less time in syscalls.
+        let mut batch = Vec::with_capacity((size + 14).saturating_mul(pipeline));
+        while Instant::now() < deadline {
+            batch.clear();
+            for _ in 0..pipeline {
+                encode_frame(&mut frame, &payload, mask_for(seq));
+                seq = seq.wrapping_add(1);
+                batch.extend_from_slice(&frame);
+            }
+
+            let start = Instant::now();
+            if let Err(e) = ws.stream.write_all(&batch) {
+                return WorkerResult {
+                    latencies_ns,
+                    error: Some(format!("conn {id}: burst write failed: {e}")),
+                };
+            }
+            for _ in 0..pipeline {
+                if let Err(e) = read_verified_echo(&mut ws, &mut echo, &payload) {
+                    return WorkerResult {
+                        latencies_ns,
+                        error: Some(format!("conn {id}: {e}")),
+                    };
+                }
+                latencies_ns.push(start.elapsed().as_nanos() as u64);
+            }
+        }
+
+        return WorkerResult {
+            latencies_ns,
+            error: None,
+        };
+    }
+
     // Fill the pipeline: up to `pipeline` frames in flight before the first
     // echo is read. At pipeline=1 this sends exactly one frame, same as the
     // old lockstep loop's first iteration.
@@ -348,25 +421,11 @@ fn worker(
     // drained even after time runs out. At pipeline=1 this degenerates to
     // the original read-then-maybe-send-next loop.
     while let Some(start) = sent_at.pop_front() {
-        match read_frame(&mut ws, &mut echo) {
-            // Checking the opcode and length costs nothing and catches a
-            // server that answers with a Close or a truncated echo.
-            Ok(OP_BINARY) if echo.len() == size => {}
-            Ok(opcode) => {
-                return WorkerResult {
-                    latencies_ns,
-                    error: Some(format!(
-                        "conn {id}: expected a {size}-byte binary echo, got opcode {opcode:#x} of {} bytes",
-                        echo.len()
-                    )),
-                };
-            }
-            Err(e) => {
-                return WorkerResult {
-                    latencies_ns,
-                    error: Some(format!("conn {id}: read failed: {e}")),
-                };
-            }
+        if let Err(e) = read_verified_echo(&mut ws, &mut echo, &payload) {
+            return WorkerResult {
+                latencies_ns,
+                error: Some(format!("conn {id}: {e}")),
+            };
         }
         latencies_ns.push(start.elapsed().as_nanos() as u64);
 
@@ -413,8 +472,13 @@ fn main() -> ExitCode {
     };
 
     println!(
-        "ws_bench: {} conns={} size={}B secs={} pipeline={}",
-        cfg.addr, cfg.conns, cfg.size, cfg.secs, cfg.pipeline
+        "ws_bench: {} conns={} size={}B secs={} pipeline={} mode={}",
+        cfg.addr,
+        cfg.conns,
+        cfg.size,
+        cfg.secs,
+        cfg.pipeline,
+        if cfg.burst { "burst" } else { "sliding" }
     );
 
     // conns workers + this thread all rendezvous once every connection is
@@ -428,10 +492,11 @@ fn main() -> ExitCode {
         let size = cfg.size;
         let secs = cfg.secs;
         let pipeline = cfg.pipeline;
+        let burst = cfg.burst;
         let barrier = Arc::clone(&barrier);
         let tx = tx.clone();
         handles.push(thread::spawn(move || {
-            let result = worker(id, &addr, size, secs, pipeline, &barrier);
+            let result = worker(id, &addr, size, secs, pipeline, burst, &barrier);
             let _ = tx.send(result);
         }));
     }

@@ -128,14 +128,44 @@ dependencies and no knowledge of this runtime; use it with tokio if you like.
 ## Run the examples
 
 ```sh
-cargo run --release --example echo 9000        # TCP echo
+cargo run --release --example echo -- 9000     # TCP echo, loopback by default
+cargo run --release --example echo -- 9003 192.0.2.10  # explicit bind IP
 cargo run --release --example ws_echo 9001     # WebSocket echo
 ./scripts/gen-certs.sh                          # self-signed cert
 cargo run --release --example wss_echo 9002    # WebSocket over TLS 1.3
 
-cargo run --release --bin bench    -- 127.0.0.1:9000 --conns 200 --pipeline 8
-cargo run --release --bin ws_bench -- 127.0.0.1:9001 --conns 200 --pipeline 8
+cargo run --release --bin connect_bench -- 127.0.0.1:9000 --workers 16
+cargo run --release --bin connect_bench -- 127.0.0.1:9000 --workers 16 --reset-close
+cargo run --release --bin ws_bench      -- 127.0.0.1:9001 --conns 200 --pipeline 8
+cargo run --release --bin ws_bench      -- 127.0.0.1:9001 --conns 1 --pipeline 256 --burst
 ```
+
+The first connection-churn command keeps normal FIN-close semantics. The
+`--reset-close` variant still verifies the complete echoed payload, then uses
+RST so a same-host comparison measures the server rather than destination-port
+`TIME_WAIT` history.
+
+The WebSocket client also verifies every echoed payload byte. Its default
+sliding mode keeps up to `--pipeline` frames in flight while writing them one
+at a time. `--burst` writes a whole pipeline as one TCP batch and then drains
+it, which is useful for measuring coalesced-frame/codec throughput without
+making one client write syscall per frame.
+
+For the measured Linux connection-churn configuration:
+
+```sh
+cargo build --profile release-lto --example echo
+RAMJET_MULTISHOT_ACCEPT=1 RAMJET_DEFER_TASKRUN=1 \
+    target/release-lto/examples/echo 9003 127.0.0.1
+```
+
+`RAMJET_MULTISHOT_ACCEPT=1` keeps one kernel accept request armed across
+connections. It is feature-probed, falls back to ordinary accept if the kernel
+cannot cancel the arm synchronously, bounds early accepted descriptors, and
+closes driver-owned descriptors on cancellation and teardown.
+`RAMJET_DEFER_TASKRUN=1` is more kernel-sensitive: run the fuzzer soak below on
+the exact deployment kernel before enabling it. Both switches are Linux-only
+opt-ins; neither changes the portable default.
 
 Tests, including a state-machine fuzzer that has caught five real bugs:
 
@@ -175,7 +205,9 @@ Four properties that produce the numbers above:
 - **Thread-per-core, share-nothing.** The driver is `!Send` by construction.
 
 `Op::WriteFrom` lets a reply be written from inside the buffer the request
-arrived in, so echoing a WebSocket frame copies and allocates nothing.
+arrived in. The WebSocket echo fast path validates each complete frame and
+unmasks it directly into its compacted reply position, so a batch needs no
+second payload copy or output allocation.
 
 ## Security
 

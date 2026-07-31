@@ -46,7 +46,7 @@ mod utf8;
 pub mod encode;
 pub mod handshake;
 
-pub use decode::{DEFAULT_MAX_MESSAGE, Decoder, WholeFrame};
+pub use decode::{DEFAULT_MAX_MESSAGE, Decoder, EchoFrame, WholeFrame};
 
 use std::fmt;
 

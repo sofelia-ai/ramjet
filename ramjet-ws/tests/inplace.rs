@@ -9,7 +9,7 @@
 mod common;
 
 use common::*;
-use ramjet_ws::{Decoder, Error, Event, MessageKind};
+use ramjet_ws::{Decoder, Error, Event, MessageKind, encode};
 
 /// Payload length -> bytes a server's reply header occupies.
 fn reply_header_len(len: usize) -> usize {
@@ -389,6 +389,84 @@ fn a_protocol_error_mid_batch_is_terminal() {
     assert!(matches!(e, Error::Protocol(_)));
     // Sticky, exactly like the streaming path.
     assert!(d.take_frame_at(&mut wire, whole).is_err());
+}
+
+#[test]
+fn fused_echo_packs_a_mixed_batch_into_ready_server_frames() {
+    let cases: Vec<(MessageKind, Vec<u8>)> = vec![
+        (MessageKind::Binary, Vec::new()),
+        (MessageKind::Text, "héllo".as_bytes().to_vec()),
+        (MessageKind::Binary, vec![0xA5; 125]),
+        (MessageKind::Binary, vec![0x5A; 126]),
+        (MessageKind::Text, vec![b'z'; 1000]),
+    ];
+    let mut wire = Vec::new();
+    let mut expected = Vec::new();
+    for (kind, payload) in &cases {
+        let opcode = match kind {
+            MessageKind::Text => TEXT,
+            MessageKind::Binary => BINARY,
+        };
+        wire.extend_from_slice(&frame(true, opcode, payload));
+        match kind {
+            MessageKind::Text => encode::text(&mut expected, std::str::from_utf8(payload).unwrap()),
+            MessageKind::Binary => encode::binary(&mut expected, payload),
+        }
+    }
+    let input_len = wire.len();
+
+    let mut d = Decoder::new();
+    let mut from = 0usize;
+    let mut to = 0usize;
+    for (kind, payload) in &cases {
+        let echoed = d
+            .take_echo_frame_at(&mut wire, from, to)
+            .expect("valid frame")
+            .expect("whole data frame");
+        assert_eq!(&wire[echoed.payload.clone()], &payload[..]);
+        let opcode = match kind {
+            MessageKind::Text => 0x1,
+            MessageKind::Binary => 0x2,
+        };
+        assert_eq!(wire[echoed.frame.start] & 0x0F, opcode);
+        from = echoed.consumed;
+        to = echoed.frame.end;
+    }
+
+    assert_eq!(from, input_len, "every client frame was consumed");
+    assert_eq!(&wire[..to], &expected, "batch is ready for one write");
+    assert!(
+        to < input_len,
+        "removing one mask from every frame must compact the batch"
+    );
+}
+
+#[test]
+fn fused_echo_declines_without_touching_partial_or_misplaced_output() {
+    let whole = frame(true, BINARY, &[7u8; 64]);
+
+    let mut partial = whole[..whole.len() - 1].to_vec();
+    let before = partial.clone();
+    let mut d = Decoder::new();
+    assert_eq!(d.take_echo_frame_at(&mut partial, 0, 0), Ok(None));
+    assert_eq!(partial, before);
+
+    let mut misplaced = whole;
+    let before = misplaced.clone();
+    let mut d = Decoder::new();
+    assert_eq!(d.take_echo_frame_at(&mut misplaced, 0, 1), Ok(None));
+    assert_eq!(misplaced, before);
+}
+
+#[test]
+fn fused_echo_validates_text_and_keeps_the_error_sticky() {
+    let mut wire = frame(true, TEXT, &[0xED, 0xA0, 0x80]);
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.take_echo_frame_at(&mut wire, 0, 0),
+        Err(Error::InvalidUtf8)
+    );
+    assert_eq!(d.next_event(), Err(Error::InvalidUtf8));
 }
 
 #[test]

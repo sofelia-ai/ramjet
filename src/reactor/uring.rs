@@ -26,10 +26,13 @@
 //! must wait. The contract leaves timing unspecified. Reads parked on an arm
 //! own no kernel-side request and are cancelled inline instead.
 //!
-//! Not armed multishot: `Op::Accept`. The ioprio bit exists and the pattern is
-//! the same, but nothing in the suite drives an accept loop hard enough to
-//! judge it, and this is a path where an unproven arm hangs the driver rather
-//! than slowing it down.
+//! `RAMJET_MULTISHOT_ACCEPT=1` opts listeners into one persistent multishot
+//! accept arm. Caller-visible `Op::Accept` semantics stay one submission to one
+//! completion: the driver pairs arm deliveries with waiting caller ops and
+//! keeps a bounded queue of early arrivals. The fast path activates only when
+//! the kernel also supports synchronous cancellation, which lets shutdown
+//! harvest and close every descriptor the arm installed before its last CQE.
+//! It remains opt-in because both primitives are kernel-specific.
 //!
 //! fd slots are freed the moment `Close` is submitted (not when its CQE
 //! lands): the kernel cannot recycle the fd number before the async close
@@ -72,6 +75,7 @@ const IORING_OP_RECV: u8 = 27;
 // addr@0/len@8/bid@12/resv@14.
 const IORING_REGISTER_PBUF_RING: libc::c_uint = 22;
 const IORING_UNREGISTER_PBUF_RING: libc::c_uint = 23;
+const IORING_REGISTER_SYNC_CANCEL: libc::c_uint = 24;
 /// sqe.flags: pick the buffer from the group in sqe.buf_index.
 const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 /// cqe.flags: the buffer id is in the top 16 bits.
@@ -79,8 +83,9 @@ const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 /// cqe.flags: this multishot arm is still live; more CQEs will follow.
 const IORING_CQE_F_MORE: u32 = 1 << 1;
-/// sqe.ioprio bit that makes RECV multishot. The ACCEPT equivalent is `1 << 0`
-/// and deliberately unused: see the module docs on what still has no arm.
+/// sqe.ioprio bit that makes ACCEPT multishot.
+const IORING_ACCEPT_MULTISHOT: u16 = 1 << 0;
+/// sqe.ioprio bit that makes RECV multishot.
 const IORING_RECV_MULTISHOT: u16 = 2;
 
 /// The one buffer group this driver uses.
@@ -118,6 +123,10 @@ const RING_BUFS: u16 = 32;
 
 /// Submission queue depth. Must be a power of two.
 const ENTRIES: u32 = 256;
+/// Bound speculative accepts while an opt-in multishot listener has no caller
+/// waiting. A continuously accepting server drains this immediately; a paused
+/// one cannot make the driver retain descriptors without limit.
+const ACCEPT_STASH_LIMIT: usize = ENTRIES as usize;
 
 /// `user_data` for internal ops (ASYNC_CANCEL) whose CQEs are swallowed.
 const SENTINEL: u64 = u64::MAX;
@@ -189,6 +198,28 @@ struct Cqe {
     user_data: u64,
     res: i32,
     flags: u32,
+}
+
+#[repr(C)]
+struct KernelTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Argument to `IORING_REGISTER_SYNC_CANCEL`.
+///
+/// Multishot accept installs process descriptors before publishing their CQEs.
+/// Drop must therefore cancel the arm synchronously and harvest its last CQEs;
+/// merely closing the ring could discard a CQE while leaving its fd installed.
+#[repr(C)]
+struct SyncCancelReg {
+    addr: u64,
+    fd: i32,
+    flags: u32,
+    timeout: KernelTimespec,
+    opcode: u8,
+    pad: [u8; 7],
+    pad2: [u64; 3],
 }
 
 const _: () = assert!(mem::size_of::<Sqe>() == 64);
@@ -398,6 +429,10 @@ impl BufRing {
 /// What an in-flight op is, and what it owns.
 enum Kind {
     Accept,
+    /// A caller's `Accept` waiting for the listener's multishot arm.
+    AcceptWaiting,
+    /// The driver's persistent accept request. One SQE, many accepted fds.
+    MultishotAccept,
     Read {
         buf: Vec<u8>,
     },
@@ -431,6 +466,12 @@ enum Stashed {
     Err(i32),
 }
 
+/// One multishot-accept delivery held until a caller submits `Op::Accept`.
+enum Accepted {
+    Fd(RawFd),
+    Err(i32),
+}
+
 struct Flight {
     fd: RawFd,
     kind: Kind,
@@ -450,6 +491,10 @@ struct FdState {
     sock: Option<bool>,
     /// Slab id of the driver-owned multishot receive arm, while armed.
     ms_arm: Option<OpId>,
+    /// Slab id of the driver-owned multishot accept arm, while armed.
+    accept_arm: Option<OpId>,
+    /// Connections accepted before the caller submitted its next `Accept`.
+    accepted: VecDeque<Accepted>,
     /// Deliveries that arrived before a caller had a read outstanding.
     stash: VecDeque<Stashed>,
 }
@@ -491,10 +536,23 @@ pub struct UringDriver {
     fds: Vec<FdState>,
     pool: Vec<Vec<u8>>,
     ready: Vec<Completion>,
+    /// Accepted descriptors in `ready` have not crossed the Driver boundary
+    /// yet. Track them until `wait` hands the completions to the caller so a
+    /// driver dropped between completion and handoff cannot leak them.
+    ready_accepted: Vec<RawFd>,
 
     /// Provided-buffer ring, when the kernel took the registration. `None`
     /// keeps the P1 single-shot path wholesale: portability over cleverness.
     bufs: Option<BufRing>,
+    /// Opt-in: serve caller Accept ops from a persistent listener arm.
+    multishot_accept: bool,
+    /// Every accept arm still capable of producing an installed descriptor.
+    /// Unlike the per-fd pointer, this survives `Op::Close` resetting an fd
+    /// slot and lets Drop synchronously retire races before unmapping the CQ.
+    active_accept_arms: Vec<OpId>,
+    /// Multishot accept arms created. Test and profiling proof that the path
+    /// actually engaged rather than silently using single-shot accept.
+    multishot_accept_arms: u64,
     /// Multishot arms established. Non-zero proves the fast path is engaged;
     /// a silent fallback to single-shot would pass every behavioural test.
     multishot_arms: u64,
@@ -596,6 +654,8 @@ const IORING_SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 
 impl UringDriver {
     pub fn new() -> io::Result<Self> {
+        let multishot_accept =
+            std::env::var_os("RAMJET_MULTISHOT_ACCEPT").is_some_and(|value| value == "1");
         // Newest discipline first; an older kernel rejects unknown setup
         // flags with EINVAL and we step down. The driver behaves identically
         // under all of them — only where the kernel runs its bookkeeping moves.
@@ -724,7 +784,11 @@ impl UringDriver {
             fds: Vec::new(),
             pool: Vec::new(),
             ready: Vec::new(),
+            ready_accepted: Vec::new(),
             bufs: None,
+            multishot_accept: false,
+            active_accept_arms: Vec::new(),
+            multishot_accept_arms: 0,
             multishot_arms: 0,
             ring_buffers_consumed: 0,
             ring_buffers_reclaimed: 0,
@@ -748,6 +812,11 @@ impl UringDriver {
         let mut pool = mem::take(&mut me.pool);
         me.bufs = BufRing::new(me.ring, &mut pool).ok();
         me.pool = pool;
+        // Multishot accept arrived in Linux 5.19, but synchronous cancellation
+        // arrived in 6.0. The latter is a correctness requirement here: an
+        // accepted fd can exist before userspace has consumed its CQE, so Drop
+        // must be able to cancel and harvest the arm deterministically.
+        me.multishot_accept = multishot_accept && me.sync_cancel_supported();
         Ok(me)
     }
 
@@ -773,6 +842,8 @@ impl UringDriver {
                 "{id}={}{}",
                 match f.kind {
                     Kind::Accept => "Accept",
+                    Kind::AcceptWaiting => "AcceptWaiting",
+                    Kind::MultishotAccept => "MultishotAccept",
                     Kind::Read { .. } => "Read",
                     Kind::ReadPooled { .. } => "ReadPooled",
                     Kind::PooledWaiting => "PooledWaiting",
@@ -786,7 +857,7 @@ impl UringDriver {
         };
         let mut s = format!(
             "uring: ops.live={} live_arms={} to_submit={} ready={} pool={} \
-             arms={} ring_consumed={} ring_reclaimed={} enobufs={} \
+             recv_arms={} accept_arms={} ring_consumed={} ring_reclaimed={} enobufs={} \
              enters(waiting={} submitting={}) cqes={} cqes_per_waiting_enter={:.2} \
              waits_early={} cpu_ns(enter={} wait={} thread_total={}) \
              enter_share_of_thread_cpu={:.4}",
@@ -796,6 +867,7 @@ impl UringDriver {
             self.ready.len(),
             self.pool.len(),
             self.multishot_arms,
+            self.multishot_accept_arms,
             self.ring_buffers_consumed,
             self.ring_buffers_reclaimed,
             self.enobufs,
@@ -813,6 +885,8 @@ impl UringDriver {
             if st.read_slot.is_none()
                 && st.write_slot.is_none()
                 && st.ms_arm.is_none()
+                && st.accept_arm.is_none()
+                && st.accepted.is_empty()
                 && st.stash.is_empty()
             {
                 continue;
@@ -840,11 +914,14 @@ impl UringDriver {
             // SAFETY: FIONREAD writes one c_int.
             unsafe { libc::ioctl(fd as RawFd, libc::FIONREAD, &mut queued) };
             s.push_str(&format!(
-                "\n  fd {fd}: read={} write={} arm={} stash={stash:?} \
+                "\n  fd {fd}: read={} write={} recv_arm={} accept_arm={} \
+                 accepted={} stash={stash:?} \
                  kernel(revents={:#x} readable={queued})",
                 occupant(st.read_slot),
                 occupant(st.write_slot),
                 occupant(st.ms_arm),
+                occupant(st.accept_arm),
+                st.accepted.len(),
                 pf.revents,
             ));
         }
@@ -993,6 +1070,17 @@ impl UringDriver {
                 libc::SOCK_CLOEXEC as u32,
                 id,
             ),
+            Kind::MultishotAccept => self.push_sqe_ex(
+                IORING_OP_ACCEPT,
+                flight.fd,
+                0,
+                0,
+                libc::SOCK_CLOEXEC as u32,
+                id,
+                IORING_ACCEPT_MULTISHOT,
+                0,
+                0,
+            ),
             Kind::Read { buf } => {
                 // Caller buffer keeps its own length; read fills [0..len].
                 self.push_sqe(
@@ -1053,7 +1141,7 @@ impl UringDriver {
             ),
             // Waiting ops have no squeue entry at all — they are woken by the
             // arm's deliveries, which is what makes them free to park.
-            Kind::PooledWaiting | Kind::ReadWaiting { .. } => Ok(()),
+            Kind::AcceptWaiting | Kind::PooledWaiting | Kind::ReadWaiting { .. } => Ok(()),
         }
     }
 
@@ -1080,6 +1168,235 @@ impl UringDriver {
         self.multishot_arms += 1;
         self.live_arms += 1;
         Ok(())
+    }
+
+    fn sync_cancel(&self, id: OpId, timeout: KernelTimespec) -> io::Result<usize> {
+        let reg = SyncCancelReg {
+            addr: id,
+            fd: -1,
+            flags: 0,
+            timeout,
+            opcode: 0,
+            pad: [0; 7],
+            pad2: [0; 3],
+        };
+        // SAFETY: `reg` exactly mirrors the stable kernel ABI, remains live
+        // for the synchronous call, and this ring belongs to the driver.
+        let result = unsafe {
+            libc::syscall(
+                SYS_IO_URING_REGISTER,
+                self.ring,
+                IORING_REGISTER_SYNC_CANCEL,
+                &raw const reg,
+                1u32,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+
+    fn sync_cancel_supported(&self) -> bool {
+        match self.sync_cancel(
+            SENTINEL,
+            KernelTimespec {
+                tv_sec: -1,
+                tv_nsec: -1,
+            },
+        ) {
+            Ok(_) => true,
+            // No request uses SENTINEL while a driver is being built. ENOENT
+            // therefore proves the opcode was understood and found no match.
+            Err(error) => error.raw_os_error() == Some(libc::ENOENT),
+        }
+    }
+
+    fn shutdown_accept_arms(&mut self) {
+        if self.active_accept_arms.is_empty() {
+            return;
+        }
+        // Submit any arm that still only exists in the SQ, then make every
+        // live arm close raced accepts instead of exposing them.
+        let _ = self.flush();
+        self.drain_cq();
+        let arms = self.active_accept_arms.clone();
+        for &arm in &arms {
+            let Some(mut flight) = self.ops.take_op(arm) else {
+                continue;
+            };
+            if !matches!(flight.kind, Kind::MultishotAccept) {
+                self.ops.put_op(arm, flight);
+                continue;
+            }
+            flight.doomed = true;
+            self.ops.put_op(arm, flight);
+        }
+        for arm in arms {
+            // A finite timeout keeps Drop bounded on a broken kernel. The
+            // feature probe in `new` prevents this path on kernels without
+            // synchronous cancellation support.
+            let _ = self.sync_cancel(
+                arm,
+                KernelTimespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                },
+            );
+            // DEFER_TASKRUN kernels publish task-local completions when the
+            // issuer re-enters with GETEVENTS. `min_complete = 0` runs that
+            // work without introducing a second unbounded wait in Drop.
+            // SAFETY: plain io_uring_enter with no sigset or submissions.
+            unsafe {
+                libc::syscall(
+                    SYS_IO_URING_ENTER,
+                    self.ring,
+                    0 as libc::c_uint,
+                    0 as libc::c_uint,
+                    IORING_ENTER_GETEVENTS,
+                    ptr::null::<libc::c_void>(),
+                )
+            };
+            // Synchronous cancellation has retired the request; consume every
+            // accepted fd it published before unmapping the CQ.
+            self.drain_cq();
+        }
+    }
+
+    fn retire_accept_arm(&mut self, id: OpId) {
+        if let Some(index) = self
+            .active_accept_arms
+            .iter()
+            .position(|candidate| *candidate == id)
+        {
+            self.active_accept_arms.swap_remove(index);
+        }
+        self.live_arms = self.live_arms.saturating_sub(1);
+        self.ops.release(id);
+    }
+
+    fn handoff_ready(&mut self, out: &mut Vec<Completion>) {
+        out.append(&mut self.ready);
+        // Ownership of every successful Accept result now belongs to `out`.
+        self.ready_accepted.clear();
+    }
+
+    /// Ensure `fd` has one live multishot accept arm.
+    fn ensure_accept_arm(&mut self, fd: RawFd) -> io::Result<()> {
+        if self.fd_state(fd).accept_arm.is_some() {
+            return Ok(());
+        }
+        let id = self.ops.reserve(0);
+        let mut flight = Flight {
+            fd,
+            kind: Kind::MultishotAccept,
+            doomed: false,
+        };
+        if let Err(error) = self.arm(id, &mut flight) {
+            self.ops.release(id);
+            return Err(error);
+        }
+        self.ops.put_op(id, flight);
+        self.fd_state(fd).accept_arm = Some(id);
+        self.active_accept_arms.push(id);
+        self.multishot_accept_arms += 1;
+        self.live_arms += 1;
+        Ok(())
+    }
+
+    /// Apply the socket setup promised by `Op::Accept`.
+    fn prepare_accepted(&mut self, fd: RawFd) {
+        self.fd_state(fd).sock = Some(true);
+        let on: libc::c_int = 1;
+        // SAFETY: `on` is a live c_int with the advertised size.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&raw const on).cast(),
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+    }
+
+    fn stash_accept(&mut self, listener: RawFd, accepted: Accepted) {
+        if self.fd_state(listener).accepted.len() < ACCEPT_STASH_LIMIT {
+            self.fd_state(listener).accepted.push_back(accepted);
+        } else if let Accepted::Fd(fd) = accepted {
+            // The application stopped submitting Accept. Keep speculative
+            // ownership bounded rather than exhausting its descriptor table.
+            // SAFETY: the arm has not exposed this descriptor to any caller.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// Pair one accept-arm delivery with the caller waiting on this listener,
+    /// or retain it until the caller submits its next `Op::Accept`.
+    fn deliver_accept(&mut self, listener: RawFd, accepted: Accepted) {
+        let slot = self.fd_state(listener).read_slot;
+        let waiting = slot.filter(|&id| {
+            matches!(
+                self.ops.peek(id).map(|flight| &flight.kind),
+                Some(Kind::AcceptWaiting)
+            )
+        });
+        let Some(waiting) = waiting else {
+            self.stash_accept(listener, accepted);
+            return;
+        };
+        let Some(flight) = self.ops.take_op(waiting) else {
+            self.stash_accept(listener, accepted);
+            return;
+        };
+        debug_assert!(matches!(flight.kind, Kind::AcceptWaiting));
+        let user = self.ops.user(waiting);
+        let result = match accepted {
+            Accepted::Fd(fd) => {
+                self.ready_accepted.push(fd);
+                Ok(i64::from(fd))
+            }
+            Accepted::Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+        };
+        self.free_slot(listener, true);
+        self.ready.push(Completion {
+            id: waiting,
+            user,
+            result,
+            buf: None,
+        });
+        self.ops.release(waiting);
+    }
+
+    /// The kernel rejected multishot accept. Turn the already-pending caller
+    /// op into an ordinary accept without exposing a synthetic error or
+    /// requiring the application to resubmit.
+    fn fallback_accept_waiter(&mut self, listener: RawFd) {
+        let Some(waiting) = self.fd_state(listener).read_slot else {
+            return;
+        };
+        let Some(mut flight) = self.ops.take_op(waiting) else {
+            return;
+        };
+        if !matches!(flight.kind, Kind::AcceptWaiting) {
+            self.ops.put_op(waiting, flight);
+            return;
+        }
+        let user = self.ops.user(waiting);
+        flight.kind = Kind::Accept;
+        if let Err(error) = self.arm(waiting, &mut flight) {
+            self.free_slot(listener, true);
+            self.ready.push(Completion {
+                id: waiting,
+                user,
+                result: Err(error),
+                buf: None,
+            });
+            self.ops.release(waiting);
+        } else {
+            self.ops.put_op(waiting, flight);
+        }
     }
 
     /// Whether this fd should use the multishot path at all.
@@ -1253,6 +1570,63 @@ impl UringDriver {
         };
         let user = self.ops.user(id);
 
+        if matches!(flight.kind, Kind::MultishotAccept) {
+            if let Some(buf) = selected {
+                pool::put(&mut self.pool, buf);
+            }
+            let listener = flight.fd;
+            let more = flags & IORING_CQE_F_MORE != 0;
+            let errno = res.checked_neg().filter(|_| res < 0);
+
+            if flight.doomed {
+                // A connection can race with cancellation. It was never handed
+                // to the caller, so close it here rather than leak an installed
+                // process descriptor.
+                if res >= 0 {
+                    // SAFETY: this accepted descriptor belongs exclusively to
+                    // the doomed arm and is not visible anywhere else.
+                    unsafe { libc::close(res) };
+                }
+                if more {
+                    self.ops.put_op(id, flight);
+                } else {
+                    if self.fd_state(listener).accept_arm == Some(id) {
+                        self.fd_state(listener).accept_arm = None;
+                    }
+                    self.retire_accept_arm(id);
+                }
+                return;
+            }
+
+            let unsupported = !more
+                && errno.is_some_and(|errno| {
+                    [libc::EINVAL, libc::EOPNOTSUPP, libc::ENOSYS].contains(&errno)
+                });
+            if unsupported {
+                self.multishot_accept = false;
+                self.fd_state(listener).accept_arm = None;
+                self.retire_accept_arm(id);
+                self.fallback_accept_waiter(listener);
+                return;
+            }
+
+            if !more {
+                self.fd_state(listener).accept_arm = None;
+            }
+            if res >= 0 {
+                self.prepare_accepted(res);
+                self.deliver_accept(listener, Accepted::Fd(res));
+            } else {
+                self.deliver_accept(listener, Accepted::Err(errno.unwrap_or(libc::EIO)));
+            }
+            if more {
+                self.ops.put_op(id, flight);
+            } else {
+                self.retire_accept_arm(id);
+            }
+            return;
+        }
+
         // Only the multishot arm asks for kernel-selected buffers. If one turns
         // up on any other op it belongs to nobody; give it back rather than
         // drop it on the floor.
@@ -1266,6 +1640,13 @@ impl UringDriver {
 
         if flight.doomed {
             // Close already freed the fd slots; just deliver the contract.
+            if matches!(flight.kind, Kind::Accept) && res >= 0 {
+                // The accept won its race with cancellation, but Close already
+                // promised ECANCELED to the caller. The installed descriptor
+                // therefore never crosses the driver boundary.
+                // SAFETY: this successful doomed accept is driver-owned.
+                unsafe { libc::close(res) };
+            }
             let buf = match flight.kind {
                 Kind::Read { buf } => Some(buf),
                 Kind::Write { buf, .. } => Some(buf),
@@ -1276,7 +1657,12 @@ impl UringDriver {
                 }
                 Kind::ReadWaiting { buf } => Some(buf),
                 // Parked pooled reads and the arm itself own nothing.
-                Kind::Accept | Kind::Close | Kind::PooledWaiting | Kind::MultishotRecv => None,
+                Kind::Accept
+                | Kind::AcceptWaiting
+                | Kind::MultishotAccept
+                | Kind::Close
+                | Kind::PooledWaiting
+                | Kind::MultishotRecv => None,
             };
             self.ready.push(Completion {
                 id,
@@ -1347,20 +1733,10 @@ impl UringDriver {
                 let result = if res < 0 {
                     Err(io::Error::from_raw_os_error(-res))
                 } else {
-                    // Same duties as kqueue's prepare(), Linux edition: Nagle
-                    // off. Non-blocking is irrelevant under io_uring and
-                    // SIGPIPE is handled per-send with MSG_NOSIGNAL.
-                    let on: libc::c_int = 1;
-                    // SAFETY: `on` is a live c_int with the advertised size.
-                    unsafe {
-                        libc::setsockopt(
-                            res,
-                            libc::IPPROTO_TCP,
-                            libc::TCP_NODELAY,
-                            (&raw const on).cast(),
-                            mem::size_of::<libc::c_int>() as libc::socklen_t,
-                        )
-                    };
+                    // accept(2) can only return a socket. Cache that fact and
+                    // apply the same socket setup as a multishot delivery.
+                    self.prepare_accepted(res);
+                    self.ready_accepted.push(res);
                     Ok(res as i64)
                 };
                 self.free_slot(flight.fd, true);
@@ -1453,8 +1829,12 @@ impl UringDriver {
                 });
                 self.ops.release(id);
             }
-            // Woken by `deliver`, never by a completion queue entry.
-            Kind::PooledWaiting | Kind::ReadWaiting { .. } | Kind::MultishotRecv => {
+            // Woken by a driver arm, never directly by a completion queue entry.
+            Kind::AcceptWaiting
+            | Kind::MultishotAccept
+            | Kind::PooledWaiting
+            | Kind::ReadWaiting { .. }
+            | Kind::MultishotRecv => {
                 self.ops.put_op(id, flight);
             }
             Kind::Close => {
@@ -1496,14 +1876,37 @@ impl UringDriver {
     fn submit_inner(&mut self, op: Op, user: u64) -> io::Result<OpId> {
         match op {
             Op::Accept { fd } => {
-                let st = self.fd_state(fd);
-                if st.read_slot.is_some() {
+                if self.fd_state(fd).read_slot.is_some() {
                     return Err(busy());
                 }
+                if let Some(accepted) = self.fd_state(fd).accepted.pop_front() {
+                    let id = self.ops.reserve(user);
+                    self.ops.release(id);
+                    let result = match accepted {
+                        Accepted::Fd(accepted) => {
+                            self.ready_accepted.push(accepted);
+                            Ok(i64::from(accepted))
+                        }
+                        Accepted::Err(errno) => Err(io::Error::from_raw_os_error(errno)),
+                    };
+                    self.ready.push(Completion {
+                        id,
+                        user,
+                        result,
+                        buf: None,
+                    });
+                    return Ok(id);
+                }
+                let kind = if self.multishot_accept {
+                    self.ensure_accept_arm(fd)?;
+                    Kind::AcceptWaiting
+                } else {
+                    Kind::Accept
+                };
                 let id = self.queue(
                     Flight {
                         fd,
-                        kind: Kind::Accept,
+                        kind,
                         doomed: false,
                     },
                     user,
@@ -1627,7 +2030,10 @@ impl UringDriver {
                         // A waiting op never had a squeue entry: the multishot
                         // arm was going to wake it. There is no CQE coming for
                         // it, ever, so cancel it here rather than wait forever.
-                        if let Kind::PooledWaiting | Kind::ReadWaiting { .. } = f.kind {
+                        if let Kind::AcceptWaiting
+                        | Kind::PooledWaiting
+                        | Kind::ReadWaiting { .. } = f.kind
+                        {
                             let user = self.ops.user(doomed);
                             let buf = match f.kind {
                                 Kind::ReadWaiting { buf } => Some(buf),
@@ -1656,6 +2062,25 @@ impl UringDriver {
                     self.live_arms = self.live_arms.saturating_sub(1);
                     self.ops.release(arm);
                     self.push_sqe(IORING_OP_ASYNC_CANCEL, -1, arm, 0, 0, SENTINEL)?;
+                }
+                // Unlike receive buffers, accepted descriptors are installed
+                // into this process. Keep the arm cell until its final CQE so
+                // racing accepts can be identified and closed safely.
+                if let Some(arm) = st.accept_arm {
+                    if let Some(mut flight) = self.ops.take_op(arm) {
+                        flight.doomed = true;
+                        self.ops.put_op(arm, flight);
+                        self.push_sqe(IORING_OP_ASYNC_CANCEL, -1, arm, 0, 0, SENTINEL)?;
+                    } else {
+                        self.retire_accept_arm(arm);
+                    }
+                }
+                // Early accepts belong to the driver until handed to a caller.
+                for accepted in st.accepted {
+                    if let Accepted::Fd(accepted) = accepted {
+                        // SAFETY: the fd is owned only by this stash.
+                        unsafe { libc::close(accepted) };
+                    }
                 }
                 // Stashed buffers were never the caller's; they go back.
                 for item in st.stash {
@@ -1765,7 +2190,7 @@ impl Driver for UringDriver {
             }
             self.drain_cq();
             self.waits_early += 1;
-            out.append(&mut self.ready);
+            self.handoff_ready(out);
             return Ok(());
         }
         // Nothing of the caller's in flight means nothing can wake us on their
@@ -1777,7 +2202,7 @@ impl Driver for UringDriver {
             self.flush()?;
             self.drain_cq();
             self.waits_early += 1;
-            out.append(&mut self.ready);
+            self.handoff_ready(out);
             return Ok(());
         }
         let wait_started = (self.stats_every_ms > 0).then(thread_cpu_ns);
@@ -1826,7 +2251,7 @@ impl Driver for UringDriver {
                 let _ = writeln!(std::io::stderr(), "{head}");
             }
         }
-        out.append(&mut self.ready);
+        self.handoff_ready(out);
         Ok(())
     }
 
@@ -1837,6 +2262,21 @@ impl Driver for UringDriver {
 
 impl Drop for UringDriver {
     fn drop(&mut self) {
+        self.shutdown_accept_arms();
+        for accepted in self.ready_accepted.drain(..) {
+            // SAFETY: these Accept completions have not been handed to the
+            // caller's output vector, so the driver still owns their fds.
+            unsafe { libc::close(accepted) };
+        }
+        for state in &mut self.fds {
+            for accepted in state.accepted.drain(..) {
+                if let Accepted::Fd(accepted) = accepted {
+                    // SAFETY: accepted fds stay driver-owned until a caller's
+                    // Accept completion is built.
+                    unsafe { libc::close(accepted) };
+                }
+            }
+        }
         // Unregister the buffer ring before the fd goes: its backing Vecs are
         // ours again once the kernel has let go of them.
         if let Some(mut bufs) = self.bufs.take() {
@@ -1858,7 +2298,7 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::{AsRawFd, IntoRawFd};
 
     /// Resident set size in bytes, from `/proc/self/statm` field 2 (pages).
     fn rss_bytes() -> usize {
@@ -1905,6 +2345,187 @@ mod tests {
             }
         }
         panic!("op {id} never completed");
+    }
+
+    /// A successful accept is itself proof that the returned descriptor is a
+    /// socket. Keep that fact in the fd state: probing it again on the first
+    /// pooled read cut connection-churn throughput in half under contention.
+    #[test]
+    fn accepted_descriptor_is_already_known_to_be_a_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut d = UringDriver::new().expect("ring");
+
+        let accept = d
+            .submit(Op::Accept {
+                fd: listener.as_raw_fd(),
+            })
+            .expect("accept");
+        let _client = TcpStream::connect(addr).expect("connect");
+        let fd = drain_until(&mut d, accept).result.expect("accepted") as RawFd;
+
+        assert_eq!(
+            d.fd_state(fd).sock,
+            Some(true),
+            "the first read must not issue getsockopt(SO_TYPE)"
+        );
+        d.submit(Op::Close { fd }).expect("close");
+    }
+
+    #[test]
+    fn one_multishot_accept_arm_serves_many_caller_ops() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let listener = listener.into_raw_fd();
+        let mut d = UringDriver::new().expect("ring");
+        d.multishot_accept = true;
+
+        let mut clients = Vec::new();
+        let mut accepted = Vec::new();
+        for round in 0..8u64 {
+            let tag = 0xACCE_0000 + round;
+            let id = d
+                .submit_with(Op::Accept { fd: listener }, tag)
+                .expect("accept");
+            clients.push(TcpStream::connect(addr).expect("connect"));
+            let completion = drain_until(&mut d, id);
+            assert_eq!(completion.user, tag);
+            accepted.push(completion.result.expect("accepted") as RawFd);
+        }
+
+        assert_eq!(
+            d.multishot_accept_arms, 1,
+            "eight caller Accept ops must reuse one kernel arm"
+        );
+        assert!(
+            d.fd_state(listener).accept_arm.is_some(),
+            "the accept arm must remain live"
+        );
+        for fd in accepted {
+            let close = d.submit(Op::Close { fd }).expect("close accepted");
+            let _ = drain_until(&mut d, close);
+        }
+        let close = d
+            .submit(Op::Close { fd: listener })
+            .expect("close listener");
+        let _ = drain_until(&mut d, close);
+        drop(clients);
+    }
+
+    #[test]
+    fn live_accept_arm_is_synchronously_retired_before_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let listener = listener.into_raw_fd();
+        let mut d = UringDriver::new().expect("ring");
+        if !d.sync_cancel_supported() {
+            // `new` leaves the opt-in fast path disabled on this kernel.
+            return;
+        }
+        d.multishot_accept = true;
+
+        let accept = d.submit(Op::Accept { fd: listener }).expect("accept");
+        let client = TcpStream::connect(addr).expect("connect");
+        let accepted = drain_until(&mut d, accept).result.expect("accepted") as RawFd;
+        assert_eq!(d.active_accept_arms.len(), 1, "one arm must be live");
+
+        d.shutdown_accept_arms();
+        assert!(
+            d.active_accept_arms.is_empty(),
+            "synchronous cancellation must consume the arm's final CQE"
+        );
+        assert!(
+            d.fd_state(listener).accept_arm.is_none(),
+            "the listener must not retain a stale arm id"
+        );
+
+        let close = d
+            .submit(Op::Close { fd: accepted })
+            .expect("close accepted");
+        let _ = drain_until(&mut d, close);
+        let close = d
+            .submit(Op::Close { fd: listener })
+            .expect("close listener");
+        let _ = drain_until(&mut d, close);
+        drop(client);
+    }
+
+    #[test]
+    fn multishot_accept_stash_is_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener = listener.as_raw_fd();
+        let mut d = UringDriver::new().expect("ring");
+
+        for _ in 0..ACCEPT_STASH_LIMIT * 2 {
+            d.stash_accept(listener, Accepted::Err(libc::ECONNABORTED));
+        }
+        assert_eq!(
+            d.fd_state(listener).accepted.len(),
+            ACCEPT_STASH_LIMIT,
+            "a paused caller must not grow accepted state without bound"
+        );
+    }
+
+    #[test]
+    fn unclaimed_ready_accept_is_closed_with_driver() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        // SAFETY: dup creates an independently owned descriptor on success.
+        let accepted = unsafe { libc::dup(listener.as_raw_fd()) };
+        assert!(accepted >= 0, "dup: {}", io::Error::last_os_error());
+        let mut d = UringDriver::new().expect("ring");
+        d.fd_state(listener.as_raw_fd())
+            .accepted
+            .push_back(Accepted::Fd(accepted));
+
+        d.submit(Op::Accept {
+            fd: listener.as_raw_fd(),
+        })
+        .expect("accept from stash");
+        assert_eq!(d.ready_accepted, [accepted]);
+        drop(d);
+
+        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        assert_eq!(
+            unsafe { libc::fcntl(accepted, libc::F_GETFD) },
+            -1,
+            "Drop must close an Accept result that wait never handed off"
+        );
+    }
+
+    #[test]
+    fn successful_doomed_accept_is_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        // SAFETY: dup creates an independently owned descriptor on success.
+        let accepted = unsafe { libc::dup(listener.as_raw_fd()) };
+        assert!(accepted >= 0, "dup: {}", io::Error::last_os_error());
+        let mut d = UringDriver::new().expect("ring");
+        let id = d.ops.reserve(0);
+        d.ops.put_op(
+            id,
+            Flight {
+                fd: listener.as_raw_fd(),
+                kind: Kind::Accept,
+                doomed: true,
+            },
+        );
+
+        d.complete(id, accepted, 0);
+
+        // SAFETY: F_GETFD only inspects the numeric descriptor.
+        assert_eq!(
+            unsafe { libc::fcntl(accepted, libc::F_GETFD) },
+            -1,
+            "an accept that beats cancellation must not leak its fd"
+        );
+        assert_eq!(
+            d.ready
+                .pop()
+                .expect("ECANCELED completion")
+                .result
+                .expect_err("doomed accept must fail")
+                .raw_os_error(),
+            Some(libc::ECANCELED)
+        );
     }
 
     /// A read that arms multishot, then meets EOF, then reads again: the second

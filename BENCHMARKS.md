@@ -1,153 +1,152 @@
 # Benchmarks
 
-Every number here is measured, reproducible from [`bench/`](bench/), and
-reported with what it does *not* prove. Rivals are their own stock echo
-examples, single-threaded, compression off, `TCP_NODELAY` on.
+This document reports measured results, not universal performance claims.
+Current comparisons come first; older results retained for project history are
+explicitly labelled. Exact competitor builds and commands are in
+[`bench/README.md`](bench/README.md), and protocol results are in
+[`CONFORMANCE.md`](CONFORMANCE.md).
 
-## Throughput
+Unless stated otherwise, every client verifies the opcode, length, and every
+echoed payload byte. Rivals use their single-threaded echo examples with
+compression disabled and `TCP_NODELAY` enabled.
 
-| Workload | ramjet | rival | margin |
-|---|---|---|---|
-| WS 64 B, 200 conns, K8 — **two machines, real NIC** | **348,692** | uWebSockets 228,626 | **+52.5%**, p99 −45% |
-| TCP 500 conns, K8 — loopback | **649,847** | uSockets 549,047 | +18.4%, p99 −26% |
-| TCP 500 conns, K8 — loopback | **637,878** | tokio 521,797 | +22.2% |
-| TCP 200 conns, lockstep — loopback | **124,379** | uSockets 113,094 | +10.0% |
-| TCP 200 conns, lockstep — loopback | **123,988** | tokio 110,211 | +12.5% |
+## Current C7i comparison
 
-`K8` = 8 messages in flight per connection. Medians of alternating runs.
+Measured on one EC2 `c7i.large` running Linux `7.0.0-1006-aws`. The server was
+pinned to CPU 0 and the client to CPU 1. These logical CPUs are sibling
+hyperthreads on one physical core, so the result is a controlled loopback
+comparison, not independent-core or real-network scaling.
 
-**Trust the first row most.** Client and server on separate hosts, a real NIC
-in the path, verified server-bound (server core at 60% sys / 34% softirq / 0%
-idle at only 31 MB/s). It also *reverses* the loopback result at the same
-configuration, where uWebSockets led 733k to 389k — because loopback has no
-network stack, so the per-message syscall cost that io_uring exists to remove
-barely registers. Loopback systematically flatters epoll.
+Ramjet used fat LTO with:
 
-## Memory — 100,000 idle connections, accepted and held
+```text
+RAMJET_MULTISHOT_ACCEPT=1 RAMJET_DEFER_TASKRUN=1
+```
 
-| Server | total RSS | per connection |
-|---|---|---|
-| uSockets (TCP) | **9.8 MB** | **79 B** |
-| ramjet (TCP) | 27.4 MB | 255 B |
-| uWebSockets (WS) | 29.0 MB | 256 B |
-| **ramjet (WS)** | **52.9 MB** | **516 B** |
-| tokio (TCP) | 877.3 MB | 8,960 B |
+uWebSockets was pinned to
+`fe7da4cb05622b8d004718ec3ca05101782eb1c2`, with uSockets submodule
+`86097c490263ab662d62e8e7b541390bdec7d149`. The raw uSockets comparison used
+`2353808c2e605c4f38bd9f09261fff13ae2a58be`. Both rivals were built with
+`-O3 -flto`, without TLS or compression.
 
-Per-connection cost is stable between 10k and 100k for every server, which is
-the check that these are real. ramjet holds 100k WebSocket connections in
-53 MB where tokio needs 877 MB for plain TCP. uSockets keeps the crown — its
-echo holds no per-connection buffer at all.
+Each result is the median of five alternating three-second trials after
+warm-up. The p99 column is Ramjet followed by its rival.
 
-## Efficiency
+| Protocol and workload | Ramjet | Rival | Throughput result | Median p99 |
+|---|---:|---:|---|---:|
+| WebSocket, 64 B, one connection, 256-frame burst | **1,714,653/s** | uWebSockets 1,684,539/s | **Ramjet +1.79%** | **142.0** vs 144.9 µs |
+| WebSocket, 4 KiB, one connection, 64-frame burst | 301,078/s | **uWebSockets 306,158/s** | **uWS +1.69%** | 133.0 vs **129.5 µs** |
+| WebSocket, 64 B, 50 connections, lockstep | 197,131/s | uWebSockets 196,524/s | tied; ranges overlap | 452.2 vs **421.0 µs** |
+| TCP lifecycle, 64 B, 4 workers | **61,794/s** | uSockets 59,108/s | **Ramjet +4.5%** | **123.7** vs 133.6 µs |
+| TCP lifecycle, 64 B, 16 workers | **61,292/s** | uSockets 58,619/s | **Ramjet +4.6%** | **591.1** vs 645.6 µs |
 
-| Property | Measurement |
-|---|---|
-| Syscalls under load | ~1 `io_uring_enter` per 900–1,100 requests |
-| Cost of 100k idle connections to active throughput | none: 718,508 → 719,396 req/s |
-| Idle server floor | 131 KB resident against a 2 MiB registered ring |
-| Library dependencies | `libc` |
+### Reading the result
 
-That third row is worth explaining: registering a provided-buffer ring hands
-the kernel a descriptor array, not pinned pages, so ring buffers stay untouched
-virtual memory until traffic faults them in.
+- The improved WebSocket server moved from 1,693,704/s to 1,714,653/s at
+  64 B: **+1.24%**. Its five-trial range, 1,708,414–1,720,959/s, did not
+  overlap the original server or uWebSockets.
+- The 4 KiB change is neutral relative to the original Ramjet server, while
+  uWebSockets retains a measurable 1.69% lead.
+- At 50 lockstep connections, throughput is unresolved and uWebSockets has a
+  7.4% better p99. Ramjet does not have a universal latency lead.
+- `--burst` writes one complete pipeline as a TCP batch and then drains it. It
+  removes the load generator's one-write-syscall-per-frame ceiling and measures
+  coalesced-frame throughput; it is not a one-message latency test.
+- The TCP lifecycle is connect → 64 B write → exact echo read → RST close.
+  Reset-close prevents destination-port `TIME_WAIT` history from deciding a
+  same-host connection benchmark.
 
-## Conformance
+## Stability and correctness
 
 | Check | Result |
 |---|---|
-| Autobahn, `ws://` | 517 cases, **0 failed** |
-| Autobahn, `wss://` | 517 cases, **0 failed** — identical distribution |
-| Chrome over the internet, `ws://` | 4/4, clean close |
-| Chrome over the internet, `wss://` (TLS 1.3) | 4/4, clean close |
-| Tests | 135 macOS, 134 Linux, fuzzer soaks clean on both backends |
+| Final WebSocket binary, 60-second soak | 12,261,617 verified echoes; 204,245/s; p99 421.1 µs; zero errors |
+| WebSocket resource hygiene | descriptors 5 → 5; RSS 2,416 → 2,812 KiB; no cgroup throttling |
+| Provided-buffer ownership | 12,259,882 consumed and 12,259,882 reclaimed |
+| Final TCP lifecycle binary, 60-second soak | 3,414,977 verified lifecycles; zero errors and zero `TIME_WAIT` |
+| Autobahn `ws://` | 517 cases; **0 failures and 0 bad closes** |
+| Autobahn `wss://` | previous full run: 517 cases and **0 failures** |
+| Codec release fuzzing | 10,000 configured cases passed |
+| Workspace checks | tests passed; Clippy passed with warnings denied |
 
-Details in [CONFORMANCE.md](CONFORMANCE.md).
+The WebSocket soak observed 142 transient provided-buffer `ENOBUFS` results.
+Those are handled by re-arming receive; no bytes, connections, or buffers were
+lost. The exact production-kernel driver fuzzer also passed with multishot
+accept and deferred task running enabled. The tested final WebSocket server's
+SHA-256 is
+`4946a98583e2e51665eabd0cbe720a03bc0da0ada1e4b563634cded4b71538d7`.
 
-## Not claimed
+## Historical reference results
 
-- **4 KiB payloads on the two-machine rig** — network-bound there (29,303 req/s
-  at 240 MB/s, server core 55% *iowait*, second core idle). Those comparisons
-  stay on loopback, where they are at least engine-limited.
-- **10k *active* connections** — the load generator is thread-per-connection
-  and collapses first (9,546 req/s at p99 6.1 s). That is the client, not the
-  server. Needs an event-driven generator.
-- **Thread-per-core scaling** — `examples/echo_mt` works, but one box cannot
-  prove it: client and server contend for the same cores.
-- **uWebSockets under concurrent-accept load** — its process held 8 descriptors
-  while the client reported 100k connections established, contradicting its own
-  idle-matrix figure. Unexplained, so withheld.
+These measurements predate the current C7i run and remain here because they
+support headline comparisons elsewhere in the repository. They must not be
+combined with current numbers: the hardware and load generators differ.
 
-## Rigs
+| Historical workload | Ramjet | Rival | Result |
+|---|---:|---:|---|
+| WebSocket, 64 B, 200 connections, K8, two machines and a real NIC | **348,692/s** | uWebSockets 228,626/s | **+52.5%**, p99 45% lower |
+| TCP, 64 B, 500 connections, K8, loopback | **649,847/s** | uSockets 549,047/s | **+18.4%**, p99 26% lower |
+| TCP, 64 B, 500 connections, K8, loopback | **637,878/s** | tokio 521,797/s | **+22.2%** |
 
-**Loopback, one box.** Server pinned to core 0. Resolves large payloads;
-flatters epoll; client and server share a machine.
+`K8` means eight messages in flight per connection.
 
-**Two machines, same AZ, private VPC**, 289 µs p50 TCP RTT. Removes the
-contention confound and puts a real NIC in the path. Server-bound at 64 B,
-network-bound by 4 KiB on the instance sizes used.
+The two-machine WebSocket result was server-bound at 64 B: the server core was
+fully occupied while traffic was only 31 MB/s. Its 4 KiB workload was
+network-bound and is intentionally excluded.
 
-Neither resolves everything. An instance with a real network allowance would
-settle both at once. Build recipes and rig rules: [`bench/README.md`](bench/README.md).
+A separate T2-to-C7i private-VPC TCP validation found overlapping ranges for
+Ramjet and uSockets. The T2 CPU limited small messages and the path plateaued
+near 2 Gbit/s for 4 KiB messages, so that run demonstrates interoperability and
+stability, not an engine winner.
 
-## What shipped, and what was rejected
+## Capacity measurements
 
-Five optimisations shipped. **Five were rejected on measurement, three before
-any code was written.** Both lists are here because the rejections cost real
-time and nobody should re-walk them.
+These are historical 100,000-idle-connection measurements and were not rerun
+for the latest codec change.
 
-**Shipped**
+| Server | Total RSS | Per connection |
+|---|---:|---:|
+| uSockets, TCP | **9.8 MB** | **79 B** |
+| Ramjet, TCP | 27.4 MB | 255 B |
+| uWebSockets, WebSocket | 29.0 MB | 256 B |
+| Ramjet, WebSocket | 52.9 MB | 516 B |
+| tokio, TCP | 877.3 MB | 8,960 B |
 
-| Change | Effect |
+| Property | Measurement |
 |---|---|
-| Multishot recv over a kernel buffer ring | 4,272 → 475 B per idle connection |
-| 64 KiB buffers, 32-entry ring | +123% at 4 KiB payloads, *lower* idle memory |
-| Word-at-a-time WebSocket unmask | +31.5% at 4 KiB |
-| Slab op-tracking, `submit_with(user_data)`, zero-copy `WriteFrom` | hashing and per-message allocation off the hot path |
-| Fairness: harvest completions even when work is ready | p99 10.3 ms → 2.1 ms at 1000 conns |
+| Syscalls under sustained load | approximately one `io_uring_enter` per 900–1,100 requests |
+| Effect of 100,000 idle connections on active throughput | none measured: 718,508 → 719,396/s |
+| Idle server floor | 131 KiB resident against a 2 MiB registered ring |
+| Runtime library dependencies | `libc` |
 
-**Rejected**
+## Optimization decisions
 
-| Hypothesis | Verdict |
+Only changes that survived repeated A/B measurements remain in the hot path.
+
+| Change | Decision |
 |---|---|
-| WebSocket write amplification | Did not exist — already 6.75 messages per write |
-| Batch corking | ~1%, inside noise (kept anyway: strictly less work per message) |
-| Eager inline `send` before the ring | **−50%** |
-| `min_complete > 1` | Unbuilt: harvests already ~1,600 completions each |
-| Buffer size classes with per-fd promotion | Unbuilt: two constants got the whole win at no memory cost |
-| kTLS | Unbuilt: rustls consumes the connection when extracting keys |
+| Fuse frame validation, unmasking, and reply compaction | shipped; removes one payload pass |
+| Use 16-byte unmasking for 32–512 B and 8-byte words above it | shipped; final 64 B result +1.24%, 4 KiB neutral |
+| Persistent multishot accept with deterministic descriptor ownership | shipped; changed fresh-lifecycle result from 1.7–2.3% behind to 4.5% ahead |
+| Dense descriptor-indexed WebSocket connection table | removed; 0.5–0.7% slower |
+| Always use 16-byte unmasking | removed; approximately 2% slower at 4 KiB |
+| Manually unroll large-message unmasking | removed; 1.2–2.5% slower |
 
-Three deserve a sentence, because the reasoning generalises.
+## Limits
 
-**Eager send** is the fast path that wins on kqueue and loses on io_uring —
-same idea, opposite verdict, because the cost model inverts. Its completions
-landed in the ready queue, so `wait()` stopped entering the kernel to harvest
-and the read side re-armed three times as often. It removed a round trip and
-destroyed a harvest.
+- Burst throughput and lockstep latency answer different questions; neither
+  replaces the other.
+- The uSockets result uses its normal epoll backend. It does **not** test
+  uNetworking's separate experimental userspace
+  [`tcp`](https://github.com/uNetworking/tcp) stack.
+- Thread-per-core scaling and 10,000 simultaneously active connections have not
+  been demonstrated with a load generator that stays out of the way.
+- Large-message performance is not a Ramjet win on the current rig.
 
-**`min_complete`** was killed by a twenty-minute measurement instead of a day
-of work. The ceiling for any fewer-syscalls lever is syscall *count* ×
-per-crossing cost — never time spent *inside* the syscall, which also contains
-your real I/O. Measured naively, 97% of CPU was "inside `io_uring_enter`" and
-the lever looked essential; measured correctly its ceiling was 0.017%.
+Before making a production-wide performance claim, repeat the current matrix
+between two adequately provisioned machines over their private network.
 
-**kTLS** is blocked by an API rather than a number: every
-`dangerous_extract_secrets` takes `self` by value, so taking the send keys
-destroys the decryptor and forces RX offload too — and kTLS RX needs `recvmsg`
-with control-message parsing on the hottest path in the system.
+## Reproduce
 
-## Measurement rules this cost us
-
-- **Verify the feature is engaged, not just that tests pass.** Multishot buffer
-  rings were registered, tested, benchmarked, and *never switched on* for a
-  whole round. There are counters and an engagement test now.
-- **Verify the server is listening before believing a number.** One sweep
-  benchmarked a stale process left on the port.
-- **Alternate conditions within a run and report ranges.** These boxes drift —
-  one went 610k → 222k on an identical config within a session.
-- **Three reps is not a sample.** A comparison here flipped sign between three
-  reps and five. Take reps until ranges separate, or call the cell unresolvable.
-- **Read the whole report.** A four-second stall was visible only as
-  `latency max: 4,003,579 µs` beside merely-mediocre throughput.
-- **A round-trip test can pass against broken code.** Mask-then-unmask succeeds
-  regardless of key phase, because XOR is self-inverse. Compare against a naive
-  reference instead.
+Pinned revisions, build flags, CPU placement, benchmark commands, and the rules
+for alternating trials are in [`bench/README.md`](bench/README.md).

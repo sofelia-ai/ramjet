@@ -1,151 +1,190 @@
-/* This is a basic TCP/TLS echo server. */
+/*
+ * Benchmark TCP echo server derived from uSockets' examples/echo_server.c at
+ * 2353808c2e605c4f38bd9f09261fff13ae2a58be.
+ *
+ * This intentionally uses the upstream library's normal Linux backend and
+ * socket defaults. TLS, per-message logging, and per-message idle timer
+ * updates are disabled so the benchmark measures the transport loop itself.
+ */
 
 #include <libusockets.h>
-const int SSL = 0;
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Our socket extension */
+#define SSL 0
+
 struct echo_socket {
 	char *backpressure;
 	int length;
 };
 
-/* Our socket context extension */
 struct echo_context {
-
+	int unused;
 };
 
-/* Loop wakeup handler */
-void on_wakeup(struct us_loop_t *loop) {
-
+static void on_wakeup(struct us_loop_t *loop) {
+	(void) loop;
 }
 
-/* Loop pre iteration handler */
-void on_pre(struct us_loop_t *loop) {
-
+static void on_pre(struct us_loop_t *loop) {
+	(void) loop;
 }
 
-/* Loop post iteration handler */
-void on_post(struct us_loop_t *loop) {
-
+static void on_post(struct us_loop_t *loop) {
+	(void) loop;
 }
 
-/* Socket writable handler */
-struct us_socket_t *on_echo_socket_writable(struct us_socket_t *s) {
+static struct us_socket_t *on_echo_socket_writable(struct us_socket_t *s) {
 	struct echo_socket *es = (struct echo_socket *) us_socket_ext(SSL, s);
-
-	/* Continue writing out our backpressure */
 	int written = us_socket_write(SSL, s, es->backpressure, es->length, 0);
-	if (written != es->length) {
-		char *new_buffer = (char *) malloc(es->length - written);
-		memcpy(new_buffer, es->backpressure + written, es->length - written);
-		free(es->backpressure);
-		es->backpressure = new_buffer;
-		es->length -= written;
+
+	if (written < 0) {
+		written = 0;
+	}
+
+	if (written < es->length) {
+		int remaining = es->length - written;
+		memmove(es->backpressure, es->backpressure + written, (size_t) remaining);
+		es->length = remaining;
 	} else {
 		free(es->backpressure);
+		es->backpressure = NULL;
 		es->length = 0;
 	}
 
-	/* Client is not boring */
-	us_socket_timeout(SSL, s, 30);
-
 	return s;
 }
 
-/* Socket closed handler */
-struct us_socket_t *on_echo_socket_close(struct us_socket_t *s, int code, void *reason) {
+static struct us_socket_t *on_echo_socket_close(
+	struct us_socket_t *s,
+	int code,
+	void *reason
+) {
 	struct echo_socket *es = (struct echo_socket *) us_socket_ext(SSL, s);
 
-	printf("Client disconnected\n");
-
+	(void) code;
+	(void) reason;
 	free(es->backpressure);
+	es->backpressure = NULL;
+	es->length = 0;
 
 	return s;
 }
 
-/* Socket half-closed handler */
-struct us_socket_t *on_echo_socket_end(struct us_socket_t *s) {
+static struct us_socket_t *on_echo_socket_end(struct us_socket_t *s) {
 	us_socket_shutdown(SSL, s);
 	return us_socket_close(SSL, s, 0, NULL);
 }
 
-/* Socket data handler */
-struct us_socket_t *on_echo_socket_data(struct us_socket_t *s, char *data, int length) {
+static struct us_socket_t *on_echo_socket_data(
+	struct us_socket_t *s,
+	char *data,
+	int length
+) {
 	struct echo_socket *es = (struct echo_socket *) us_socket_ext(SSL, s);
-
-	/* Print the data we received */
-	printf("Client sent <%.*s>\n", length, data);
-
-	/* Send it back or buffer it up */
 	int written = us_socket_write(SSL, s, data, length, 0);
-	if (written != length) {
-		char *new_buffer = (char *) malloc(es->length + length - written);
-		memcpy(new_buffer, es->backpressure, es->length);
-		memcpy(new_buffer + es->length, data + written, length - written);
-		free(es->backpressure);
-		es->backpressure = new_buffer;
-		es->length += length - written;
+
+	if (written < 0) {
+		written = 0;
 	}
 
-	/* Client is not boring */
-	us_socket_timeout(SSL, s, 30);
+	if (written < length) {
+		int remaining = length - written;
+		size_t buffered = (size_t) es->length;
+		char *new_buffer = (char *) realloc(
+			es->backpressure,
+			buffered + (size_t) remaining
+		);
+
+		if (new_buffer == NULL) {
+			return us_socket_close(SSL, s, 0, NULL);
+		}
+
+		memcpy(new_buffer + buffered, data + written, (size_t) remaining);
+		es->backpressure = new_buffer;
+		es->length += remaining;
+	}
 
 	return s;
 }
 
-/* Socket opened handler */
-struct us_socket_t *on_echo_socket_open(struct us_socket_t *s, int is_client, char *ip, int ip_length) {
+static struct us_socket_t *on_echo_socket_open(
+	struct us_socket_t *s,
+	int is_client,
+	char *ip,
+	int ip_length
+) {
 	struct echo_socket *es = (struct echo_socket *) us_socket_ext(SSL, s);
 
-	/* Initialize the new socket's extension */
-	es->backpressure = 0;
+	(void) is_client;
+	(void) ip;
+	(void) ip_length;
+	es->backpressure = NULL;
 	es->length = 0;
 
-	/* Start a timeout to close the socket if boring */
-	us_socket_timeout(SSL, s, 30);
-
-	printf("Client connected\n");
-
 	return s;
-}
-
-/* Socket timeout handler */
-struct us_socket_t *on_echo_socket_timeout(struct us_socket_t *s) {
-	printf("Client was idle for too long\n");
-	return us_socket_close(SSL, s, 0, NULL);
 }
 
 int main(int argc, char **argv) {
 	int port = argc > 1 ? atoi(argv[1]) : 9301;
+	const char *host = argc > 2 ? argv[2] : "127.0.0.1";
+	struct us_loop_t *loop;
+	struct us_socket_context_options_t options = {0};
+	struct us_socket_context_t *echo_context;
+	struct us_listen_socket_t *listen_socket;
 
-	/* The event loop */
-	struct us_loop_t *loop = us_create_loop(0, on_wakeup, on_pre, on_post, 0);
+	if (port < 1 || port > 65535) {
+		fprintf(stderr, "invalid port: %d\n", port);
+		return 2;
+	}
 
-	/* Socket context */
-	struct us_socket_context_options_t options = {};
+	loop = us_create_loop(0, on_wakeup, on_pre, on_post, 0);
+	if (loop == NULL) {
+		fputs("failed to create uSockets loop\n", stderr);
+		return 1;
+	}
 
-	struct us_socket_context_t *echo_context = us_create_socket_context(SSL, loop, sizeof(struct echo_context), options);
+	echo_context = us_create_socket_context(
+		SSL,
+		loop,
+		sizeof(struct echo_context),
+		options
+	);
+	if (echo_context == NULL) {
+		fputs("failed to create uSockets context\n", stderr);
+		us_loop_free(loop);
+		return 1;
+	}
 
-
-	/* Registering event handlers */
 	us_socket_context_on_open(SSL, echo_context, on_echo_socket_open);
 	us_socket_context_on_data(SSL, echo_context, on_echo_socket_data);
 	us_socket_context_on_writable(SSL, echo_context, on_echo_socket_writable);
 	us_socket_context_on_close(SSL, echo_context, on_echo_socket_close);
-	us_socket_context_on_timeout(SSL, echo_context, on_echo_socket_timeout);
 	us_socket_context_on_end(SSL, echo_context, on_echo_socket_end);
 
-	/* Start accepting echo sockets */
-	struct us_listen_socket_t *listen_socket = us_socket_context_listen(SSL, echo_context, 0, port, 0, sizeof(struct echo_socket));
-
-	if (listen_socket) {
-		printf("Listening on port %d...\n", port);
-		us_loop_run(loop);
-	} else {
-		printf("Failed to listen!\n");
+	listen_socket = us_socket_context_listen(
+		SSL,
+		echo_context,
+		host,
+		port,
+		LIBUS_LISTEN_DEFAULT,
+		sizeof(struct echo_socket)
+	);
+	if (listen_socket == NULL) {
+		fprintf(stderr, "failed to listen on %s:%d\n", host, port);
+		us_socket_context_free(SSL, echo_context);
+		us_loop_free(loop);
+		return 1;
 	}
+
+	printf("uSockets echo listening on %s:%d\n", host, port);
+	fflush(stdout);
+	us_loop_run(loop);
+
+	us_listen_socket_close(SSL, listen_socket);
+	us_socket_context_free(SSL, echo_context);
+	us_loop_free(loop);
+	return 0;
 }

@@ -41,9 +41,12 @@ the whole point of sans-io.
 
 - **Server role.** Client frames must be masked (as the RFC requires) and are
   unmasked in place, word-at-a-time. Replies are written unmasked.
-- **Zero-copy is available.** `take_frame_at` hands back a payload's position
-  inside the buffer you fed, so a server can reply out of the same allocation
-  rather than assembling a new one.
+- **In-buffer echo is available.** `take_frame_at` hands back a payload's
+  position inside the buffer you fed. For a pipelined echo server,
+  `take_echo_frame_at` validates a complete frame, unmasks its payload directly
+  into the compacted reply position, and returns a ready-to-write server frame.
+  That fuses XOR and the overlapping move into one payload pass, with no second
+  allocation.
 - **The handshake is included** — request parsing and the `Sec-WebSocket-Accept`
   response, with SHA-1 and base64 implemented inline. SHA-1 is what RFC 6455
   mandates for this handshake; it is not used as a security primitive.

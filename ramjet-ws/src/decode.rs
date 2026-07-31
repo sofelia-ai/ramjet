@@ -136,6 +136,29 @@ pub struct WholeFrame {
     pub payload: Range<usize>,
 }
 
+/// A complete data frame transformed into its server-side echo representation.
+///
+/// Produced by [`Decoder::take_echo_frame_at`]. `frame` is ready to write,
+/// `payload` identifies the validated unmasked data inside it, and `consumed`
+/// is where the original client frame ended so a caller can continue walking a
+/// pipelined receive buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoFrame {
+    /// The complete unmasked server frame, including its header.
+    pub frame: Range<usize>,
+    /// The echoed payload inside [`Self::frame`].
+    pub payload: Range<usize>,
+    /// End of the original masked client frame in the receive buffer.
+    pub consumed: usize,
+}
+
+struct DataFrame {
+    kind: MessageKind,
+    opcode: u8,
+    mask: [u8; 4],
+    payload: Range<usize>,
+}
+
 /// The frame currently being read. Small and `Copy` so the payload loop can
 /// hold it while it borrows the decoder's buffers.
 #[derive(Debug, Clone, Copy)]
@@ -306,6 +329,59 @@ impl Decoder {
         self.take_data_frame(buf, from, false)
     }
 
+    /// Transform the next whole data frame into a ready-to-write server echo.
+    ///
+    /// The original masked client frame starts at `from`; the shorter unmasked
+    /// server frame is packed at `to`. The payload is unmasked directly into
+    /// its final position, fusing the XOR and overlapping compaction into one
+    /// pass. This is intended for pipelined receive buffers where several
+    /// replies are packed back-to-back before one write.
+    ///
+    /// `to` must not be after `from`. `Ok(None)` means the fast path does not
+    /// apply or the output would not fit, and leaves the buffer untouched.
+    /// Fragmented and control frames remain the streaming decoder's job.
+    pub fn take_echo_frame_at(
+        &mut self,
+        buf: &mut [u8],
+        from: usize,
+        to: usize,
+    ) -> Result<Option<EchoFrame>, Error> {
+        if to > from {
+            return Ok(None);
+        }
+        let Some(data) = self.inspect_data_frame(buf, from, false)? else {
+            return Ok(None);
+        };
+
+        let len = data.payload.len();
+        let (header, header_len) = crate::encode::header_bytes(true, data.opcode, len);
+        let Some(payload_start) = to.checked_add(header_len) else {
+            return Ok(None);
+        };
+        let Some(frame_end) = payload_start.checked_add(len) else {
+            return Ok(None);
+        };
+        if frame_end > buf.len() || payload_start > data.payload.start {
+            return Ok(None);
+        }
+
+        let consumed = data.payload.end;
+        mask::unmask_into(buf, data.payload, payload_start, data.mask, 0);
+        let payload = payload_start..frame_end;
+        if data.kind == MessageKind::Text && !utf8::is_valid(&buf[payload.clone()]) {
+            let e = Error::InvalidUtf8;
+            self.failed = Some(e.clone());
+            return Err(e);
+        }
+        buf[to..to + header_len].copy_from_slice(&header[..header_len]);
+
+        Ok(Some(EchoFrame {
+            frame: to..frame_end,
+            payload,
+            consumed,
+        }))
+    }
+
     /// The shared body. `must_fill` is what separates the single-frame promise
     /// from the batch one: with it set, a frame that does not reach the end of
     /// `buf` is declined rather than taken, because the caller of
@@ -316,14 +392,38 @@ impl Decoder {
         from: usize,
         must_fill: bool,
     ) -> Result<Option<WholeFrame>, Error> {
+        let Some(data) = self.inspect_data_frame(buf, from, must_fill)? else {
+            return Ok(None);
+        };
+
+        // Committed: unmask in place. The mask repeats over the payload from its
+        // own start, not from the start of the buffer, so the phase is zero.
+        mask::unmask(&mut buf[data.payload.clone()], data.mask, 0);
+        if data.kind == MessageKind::Text && !utf8::is_valid(&buf[data.payload.clone()]) {
+            let e = Error::InvalidUtf8;
+            self.failed = Some(e.clone());
+            return Err(e);
+        }
+        Ok(Some(WholeFrame {
+            kind: data.kind,
+            payload: data.payload,
+        }))
+    }
+
+    /// Validate and describe a whole, unfragmented data frame without touching
+    /// its bytes. Both in-place paths commit only after this succeeds.
+    fn inspect_data_frame(
+        &mut self,
+        buf: &[u8],
+        from: usize,
+        must_fill: bool,
+    ) -> Result<Option<DataFrame>, Error> {
         if let Some(e) = &self.failed {
             return Err(e.clone());
         }
         if !self.is_idle() || from > buf.len() {
             return Ok(None);
         }
-        // Validate before mutating anything, so an `Ok(None)` really does leave
-        // `buf` as it was.
         let header = match parse_header(&buf[from..]) {
             Ok(Some(h)) => h,
             Ok(None) => return Ok(None),
@@ -335,7 +435,6 @@ impl Decoder {
         let kind = match header.opcode {
             OP_TEXT => MessageKind::Text,
             OP_BINARY => MessageKind::Binary,
-            // A fragment or a control frame: the streaming path owns those.
             _ => return Ok(None),
         };
         if !header.fin {
@@ -343,8 +442,6 @@ impl Decoder {
         }
         let start = from + header.header_len;
         let payload = start..start + header.len as usize;
-        // A frame the buffer does not hold all of belongs to the streaming
-        // path; so does a trailing frame when the caller promised there is none.
         if payload.end > buf.len() || (must_fill && payload.end != buf.len()) {
             return Ok(None);
         }
@@ -356,15 +453,12 @@ impl Decoder {
             return Err(e);
         }
 
-        // Committed: unmask in place. The mask repeats over the payload from its
-        // own start, not from the start of the buffer, so the phase is zero.
-        mask::unmask(&mut buf[payload.clone()], header.mask, 0);
-        if kind == MessageKind::Text && !utf8::is_valid(&buf[payload.clone()]) {
-            let e = Error::InvalidUtf8;
-            self.failed = Some(e.clone());
-            return Err(e);
-        }
-        Ok(Some(WholeFrame { kind, payload }))
+        Ok(Some(DataFrame {
+            kind,
+            opcode: header.opcode,
+            mask: header.mask,
+            payload,
+        }))
     }
 
     /// Hand the decoder more bytes. Any amount, split anywhere.

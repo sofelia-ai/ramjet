@@ -19,18 +19,30 @@ const OP_PONG: u8 = 0xA;
 /// Largest payload a control frame may carry.
 const MAX_CONTROL: usize = 125;
 
-/// Append a frame header. The mask bit stays clear: this is the server side.
-fn header(out: &mut Vec<u8>, fin: bool, opcode: u8, len: usize) {
-    out.push(if fin { 0x80 | opcode } else { opcode });
+/// Build a frame header. The mask bit stays clear: this is the server side.
+///
+/// Kept as bytes rather than writing only to a `Vec` so the decoder's fused
+/// echo path can lay a reply header into a receive buffer without allocating.
+pub(crate) fn header_bytes(fin: bool, opcode: u8, len: usize) -> ([u8; 10], usize) {
+    let mut header = [0u8; 10];
+    header[0] = if fin { 0x80 | opcode } else { opcode };
     if len < 126 {
-        out.push(len as u8);
+        header[1] = len as u8;
+        (header, 2)
     } else if len <= usize::from(u16::MAX) {
-        out.push(126);
-        out.extend_from_slice(&(len as u16).to_be_bytes());
+        header[1] = 126;
+        header[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        (header, 4)
     } else {
-        out.push(127);
-        out.extend_from_slice(&(len as u64).to_be_bytes());
+        header[1] = 127;
+        header[2..10].copy_from_slice(&(len as u64).to_be_bytes());
+        (header, 10)
     }
+}
+
+fn header(out: &mut Vec<u8>, fin: bool, opcode: u8, len: usize) {
+    let (header, used) = header_bytes(fin, opcode, len);
+    out.extend_from_slice(&header[..used]);
 }
 
 fn frame(out: &mut Vec<u8>, fin: bool, opcode: u8, payload: &[u8]) {

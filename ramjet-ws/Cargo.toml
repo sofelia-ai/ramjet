@@ -1,6 +1,6 @@
 [package]
 name = "ramjet-ws"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Sans-io WebSocket (RFC 6455) frame codec and upgrade handshake. No runtime, no I/O, no dependencies."
