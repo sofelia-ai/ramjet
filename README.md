@@ -33,7 +33,8 @@ today you drive the reactor directly, as the examples do. If you want a
 | TLS 1.3 — rustls, `wss://` | working (example) |
 | Ergonomic server API | **not started** |
 | Thread-per-core | example only, scaling unproven |
-| HTTP/1.1, QUIC | not started |
+| HTTP/1.1 — [`ramjet-http`](ramjet-http/), sans-io, zero deps | codec working, fuzzed; servers are examples |
+| QUIC | not started |
 
 ## Install
 
@@ -229,7 +230,8 @@ second payload copy or output allocation.
 src/reactor/    driver trait, io_uring + kqueue backends, slab, buffer pool
 src/net.rs      listeners with options applied before bind
 ramjet-ws/      sans-io WebSocket codec — no dependencies, no I/O, reusable
-examples/       echo, ws_echo, wss_echo, echo_mt (thread-per-core)
+ramjet-http/    sans-io HTTP/1.1 server codec — no dependencies, no I/O, reusable
+examples/       echo, ws_echo, wss_echo, http_hello, echo_mt, http_mt (thread-per-core)
 bench/          competitor sources and build recipes, so results reproduce
 ```
 
