@@ -5,7 +5,7 @@
 //! `connect` -> one write -> one echoed read -> close
 //!
 //! Usage:
-//! connect_bench <addr> [--workers N] [--size BYTES] [--secs S] [--reset-close]
+//! `connect_bench <addr> [--workers N] [--size BYTES] [--secs S] [--reset-close]`
 
 use std::env;
 use std::io::{Read, Write};

@@ -12,7 +12,7 @@
 //! it in for this would drag it into every normal build. Eighty lines of
 //! framing is the cheaper trade and keeps the tool std-only.
 //!
-//! Usage: ws_bench <addr> [--conns N] [--size BYTES] [--secs S] [--pipeline K] [--burst]
+//! Usage: `ws_bench <addr> [--conns N] [--size BYTES] [--secs S] [--pipeline K] [--burst]`
 
 use std::collections::VecDeque;
 use std::env;

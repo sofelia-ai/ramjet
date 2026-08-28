@@ -22,7 +22,8 @@
 /// overlap.
 ///
 /// Cost is flat, not per connection: the kernel picks a buffer only when bytes
-/// arrive (see [`super::uring`]), so a parked pooled read owns nothing and an
+/// arrive (see the Linux io_uring backend), so a parked pooled read owns
+/// nothing and an
 /// idle connection is unaffected by this number — 393 B/conn here, against
 /// 4,325 B when the multishot path is forced off. 64 KiB across the ring's 32
 /// entries is 2 MiB, exactly what 8 KiB across 256 entries cost, and only 131 KB
