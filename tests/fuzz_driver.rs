@@ -102,6 +102,7 @@ struct Stats {
     pooled_bytes: u64,
     stale_errors: u64,
     open_failed: u64,
+    midflight_drops: u64,
 }
 
 impl Stats {
@@ -118,12 +119,13 @@ impl Stats {
         self.pooled_bytes += o.pooled_bytes;
         self.stale_errors += o.stale_errors;
         self.open_failed += o.open_failed;
+        self.midflight_drops += o.midflight_drops;
     }
 
     /// Every one of these must be non-zero, or the run proved nothing about
     /// the path it was supposed to cover.
     fn assert_exercised(&self) {
-        let checks: [(&str, u64); 9] = [
+        let checks: [(&str, u64); 10] = [
             ("connections opened", self.conns),
             ("Read submitted", self.submitted[Kind::Read as usize]),
             (
@@ -136,6 +138,7 @@ impl Stats {
             ("completions checked", self.completions),
             ("ops cancelled by Close", self.cancelled),
             ("payload bytes verified", self.bytes_verified),
+            ("drivers dropped with live ops", self.midflight_drops),
         ];
         for (what, n) in checks {
             assert!(
@@ -866,6 +869,49 @@ impl World {
             out.len()
         );
     }
+
+    /// Exercise the teardown path the normal `finish` deliberately avoids:
+    /// destroy the driver while kernel operations are still live, then close
+    /// the caller-owned descriptors only after the driver is gone.
+    fn drop_midflight(self) {
+        assert!(
+            !self.inflight.is_empty(),
+            "mid-flight teardown needs at least one live operation"
+        );
+        let World {
+            d, conns, inflight, ..
+        } = self;
+        let mut possibly_open: HashSet<RawFd> = conns
+            .iter()
+            .filter(|conn| conn.alive)
+            .map(|conn| conn.fd)
+            .collect();
+        possibly_open.extend(
+            inflight
+                .values()
+                .filter(|flight| flight.kind == Kind::Close)
+                .map(|flight| flight.fd),
+        );
+
+        // A Close the driver has already carried out frees its descriptor
+        // number, and the harness hands that number straight back out on the
+        // next connection — so a queued Close names a number a peer socket may
+        // now own. Those are not ours to close twice: the raw close would shut
+        // a live connection, and its owner would abort on the second one.
+        let peers: HashSet<RawFd> = conns
+            .iter()
+            .filter_map(|conn| conn.client.as_ref().map(TcpStream::as_raw_fd))
+            .collect();
+
+        drop(d);
+        for fd in possibly_open.difference(&peers).copied() {
+            // SAFETY: this number is not owned by any peer socket, so it is
+            // either still the caller's connection or already closed. Nothing
+            // allocates a descriptor between the driver's Drop and this loop,
+            // so an already-won queued Close can only make this return EBADF.
+            unsafe { libc::close(fd) };
+        }
+    }
 }
 
 /// Seed of the case in flight, and a counter bumped as each case starts.
@@ -974,8 +1020,14 @@ fn fuzz_driver_state_machine() {
             for _ in 0..steps {
                 w.step();
             }
-            w.finish();
-            total.add(&w.stats);
+            if seed % 4 == 0 && !w.inflight.is_empty() {
+                w.stats.midflight_drops += 1;
+                total.add(&w.stats);
+                w.drop_midflight();
+            } else {
+                w.finish();
+                total.add(&w.stats);
+            }
         }
         // Invariant 5: the driver, its fds and every connection are gone.
         let after = probe_fd_number();
@@ -989,7 +1041,7 @@ fn fuzz_driver_state_machine() {
     println!(
         "fuzz: {cases} cases x {steps} steps | {} conns | submitted read={} pooled={} write={} \
 close={} stale={} | {} completions, {} cancelled | refused busy={} invalid={} | \
-verified {} payload bytes ({} via pooled) | {} closed-fd ops errored",
+verified {} payload bytes ({} via pooled) | {} closed-fd ops errored | {} mid-flight drops",
         total.conns,
         total.submitted[Kind::Read as usize],
         total.submitted[Kind::ReadPooled as usize],
@@ -1003,6 +1055,7 @@ verified {} payload bytes ({} via pooled) | {} closed-fd ops errored",
         total.bytes_verified,
         total.pooled_bytes,
         total.stale_errors,
+        total.midflight_drops,
     );
     if total.open_failed > 0 {
         println!(

@@ -130,6 +130,15 @@ const ACCEPT_STASH_LIMIT: usize = ENTRIES as usize;
 
 /// `user_data` for internal ops (ASYNC_CANCEL) whose CQEs are swallowed.
 const SENTINEL: u64 = u64::MAX;
+/// Drop never waits indefinitely for a kernel that fails to retire cancelled
+/// requests. Sixty-four short polls give normal cancellation ample time while
+/// keeping teardown bounded; the fallback leaks referenced memory rather than
+/// freeing it under the kernel.
+const DROP_DRAIN_ROUNDS: usize = 64;
+const DROP_POLL_MS: libc::c_int = 10;
+/// Keep a continuously readable peer from trapping completion processing in a
+/// single call forever. Remaining CQEs stay published for the next pass.
+const CQ_DRAIN_BUDGET: usize = ENTRIES as usize * 4;
 
 // ---- ABI ------------------------------------------------------------------
 // Layouts mirror <linux/io_uring.h>. They are kernel ABI: fixed forever.
@@ -269,8 +278,13 @@ struct BufRing {
     /// aliases the ring header; see [`Buf`].
     ring: *mut u8,
     ring_len: usize,
-    /// Backing storage per buffer id. `None` while the kernel owns the slot.
+    /// Backing storage per buffer id. The Vec remains here while its allocation
+    /// is published; [`BufRing::kernel_owns`] is the ownership authority.
     owned: Vec<Option<Vec<u8>>>,
+    /// Whether the allocation for a buffer id is currently published to the
+    /// kernel. A duplicate or corrupt CQE may only take a published buffer
+    /// once, and an out-of-range id is rejected without indexing the Vec.
+    kernel_owns: Vec<bool>,
     /// Our shadow of the tail the kernel reads.
     tail: u16,
 }
@@ -330,6 +344,7 @@ impl BufRing {
             ring,
             ring_len,
             owned: (0..RING_BUFS as usize).map(|_| None).collect(),
+            kernel_owns: vec![false; RING_BUFS as usize],
             tail: 0,
         };
         for bid in 0..RING_BUFS {
@@ -352,7 +367,11 @@ impl BufRing {
     /// Writes only addr/len/bid — never `resv`, because that field is the ring's
     /// tail for descriptor 0.
     fn publish(&mut self, bid: u16) {
-        let Some(buf) = self.owned[usize::from(bid)].as_mut() else {
+        let index = usize::from(bid);
+        if self.kernel_owns.get(index).copied() != Some(false) {
+            return;
+        }
+        let Some(buf) = self.owned.get_mut(index).and_then(Option::as_mut) else {
             return;
         };
         let (addr, len) = (buf.as_mut_ptr() as u64, buf.capacity() as u32);
@@ -364,6 +383,7 @@ impl BufRing {
             (*slot).len = len;
             (*slot).bid = bid;
         }
+        self.kernel_owns[index] = true;
         self.tail = self.tail.wrapping_add(1);
     }
 
@@ -379,7 +399,13 @@ impl BufRing {
     /// Take the buffer the kernel filled with `n` bytes, and give its slot a
     /// fresh one.
     fn take(&mut self, bid: u16, n: usize, pool: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
-        let mut buf = self.owned[usize::from(bid)].take()?;
+        let index = usize::from(bid);
+        let kernel_owns = self.kernel_owns.get_mut(index)?;
+        if !*kernel_owns {
+            return None;
+        }
+        *kernel_owns = false;
+        let mut buf = self.owned.get_mut(index)?.take()?;
         // SAFETY: the kernel reported writing `n` bytes into the region we
         // published, which is this Vec's capacity from its start; `n` never
         // exceeds the `len` we advertised. Claiming exactly those bytes is also
@@ -387,14 +413,15 @@ impl BufRing {
         debug_assert!(n <= buf.capacity());
         unsafe { buf.set_len(n.min(buf.capacity())) };
         // Refill the slot straight away so the ring never runs dry quietly.
-        self.owned[usize::from(bid)] = Some(pool::take(pool));
+        self.owned[index] = Some(pool::take(pool));
         self.publish(bid);
         self.commit();
         Some(buf)
     }
 
-    /// Give every buffer back to the pool and tear the ring down.
-    fn shutdown(&mut self, ring_fd: RawFd, pool: &mut Vec<Vec<u8>>) {
+    /// Unregister the group while the ring fd is still live. Buffer memory is
+    /// deliberately retained until the ring fd has also been closed.
+    fn unregister(&self, ring_fd: RawFd) -> bool {
         let reg = BufReg {
             ring_addr: 0,
             ring_entries: 0,
@@ -402,17 +429,22 @@ impl BufRing {
             flags: 0,
             resv: [0; 3],
         };
-        // SAFETY: unregistering the group we registered; failure is ignorable
-        // because closing the ring fd tears it down anyway.
-        unsafe {
+        // SAFETY: unregistering the group we registered.
+        let result = unsafe {
             libc::syscall(
                 SYS_IO_URING_REGISTER,
                 ring_fd,
                 IORING_UNREGISTER_PBUF_RING,
                 &reg as *const BufReg,
                 1 as libc::c_uint,
-            );
-        }
+            )
+        };
+        result >= 0
+    }
+
+    /// Give every buffer back after the group is unregistered and the ring fd
+    /// is closed, then release the descriptor mapping.
+    fn release(&mut self, pool: &mut Vec<Vec<u8>>) {
         for slot in &mut self.owned {
             if let Some(buf) = slot.take() {
                 pool::put(pool, buf);
@@ -526,6 +558,9 @@ pub struct UringDriver {
     cq_tail: *const AtomicU32,
     cq_mask: u32,
     cqes: *const Cqe,
+    /// Completion processing may submit and flush more work. An EBUSY flush
+    /// must not recursively consume the same CQEs and move cq_head backwards.
+    draining: bool,
 
     /// SQEs written but not yet handed to the kernel.
     to_submit: u32,
@@ -779,6 +814,7 @@ impl UringDriver {
             cq_tail,
             cq_mask,
             cqes,
+            draining: false,
             to_submit: 0,
             ops: Slab::new(),
             fds: Vec::new(),
@@ -1264,6 +1300,101 @@ impl UringDriver {
         }
     }
 
+    fn flight_has_kernel_request(flight: &Flight) -> bool {
+        !matches!(
+            &flight.kind,
+            Kind::AcceptWaiting | Kind::PooledWaiting | Kind::ReadWaiting { .. }
+        )
+    }
+
+    fn kernel_request_is_live(&self, id: OpId) -> bool {
+        self.ops
+            .peek(id)
+            .is_some_and(Self::flight_has_kernel_request)
+    }
+
+    /// Cancel and harvest every request that can still dereference memory
+    /// owned by this driver. A false result means Drop must leak those
+    /// allocations after closing the ring rather than risk freeing them while
+    /// the kernel is still finishing teardown.
+    fn quiesce_inflight(&mut self) -> bool {
+        let ids: Vec<OpId> = self
+            .ops
+            .occupied_ids()
+            .into_iter()
+            .filter(|&id| self.kernel_request_is_live(id))
+            .collect();
+        if ids.is_empty() {
+            return true;
+        }
+
+        // Mark first so a completion harvested while submissions are flushed
+        // cannot re-arm a partial write or multishot receive.
+        for &id in &ids {
+            let Some(mut flight) = self.ops.take_op(id) else {
+                continue;
+            };
+            flight.doomed = true;
+            self.ops.put_op(id, flight);
+        }
+
+        // Submit original SQEs before their cancellations. io_uring does not
+        // promise execution order between independent SQEs, so mixing both in
+        // one flush could let a cancel report ENOENT before its target exists.
+        if self.flush().is_err() {
+            return false;
+        }
+        self.drain_cq();
+
+        for &id in &ids {
+            if self.kernel_request_is_live(id)
+                && self
+                    .push_sqe(IORING_OP_ASYNC_CANCEL, -1, id, 0, 0, SENTINEL)
+                    .is_err()
+            {
+                return false;
+            }
+        }
+        if self.flush().is_err() {
+            return false;
+        }
+        self.drain_cq();
+
+        for _ in 0..DROP_DRAIN_ROUNDS {
+            if ids.iter().all(|&id| !self.kernel_request_is_live(id)) {
+                return true;
+            }
+
+            // Run deferred task work without an unbounded min_complete wait.
+            // SAFETY: plain io_uring_enter with no submissions or sigset.
+            unsafe {
+                libc::syscall(
+                    SYS_IO_URING_ENTER,
+                    self.ring,
+                    0 as libc::c_uint,
+                    0 as libc::c_uint,
+                    IORING_ENTER_GETEVENTS,
+                    ptr::null::<libc::c_void>(),
+                )
+            };
+            self.drain_cq();
+            if ids.iter().all(|&id| !self.kernel_request_is_live(id)) {
+                return true;
+            }
+
+            let mut pollfd = libc::pollfd {
+                fd: self.ring,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd and a finite timeout.
+            unsafe { libc::poll(&mut pollfd, 1, DROP_POLL_MS) };
+            self.drain_cq();
+        }
+
+        ids.iter().all(|&id| !self.kernel_request_is_live(id))
+    }
+
     fn retire_accept_arm(&mut self, id: OpId) {
         if let Some(index) = self
             .active_accept_arms
@@ -1509,37 +1640,53 @@ impl UringDriver {
         }
     }
 
-    /// Drain every CQE currently visible. No syscall.
+    /// Drain a bounded batch of currently visible CQEs. No syscall.
     fn drain_cq(&mut self) {
-        // SAFETY: ring pointers are valid for the driver's lifetime.
-        let tail = unsafe { &*self.cq_tail }.load(Ordering::Acquire);
-        let mut head = unsafe { &*self.cq_head }.load(Ordering::Relaxed);
-        while head != tail {
+        if self.draining {
+            return;
+        }
+        self.draining = true;
+        for _ in 0..CQ_DRAIN_BUDGET {
+            // Re-read both cursors on every iteration. `complete` may submit
+            // more work, and the kernel may publish more CQEs while this loop
+            // is running.
+            // SAFETY: ring pointers are valid for the driver's lifetime.
+            let head = unsafe { &*self.cq_head }.load(Ordering::Relaxed);
+            let tail = unsafe { &*self.cq_tail }.load(Ordering::Acquire);
+            if head == tail {
+                break;
+            }
             let idx = (head & self.cq_mask) as usize;
             // SAFETY: idx < cq_entries; entries below tail are published.
             let cqe = unsafe { &*self.cqes.add(idx) };
             let (user_data, res, flags) = (cqe.user_data, cqe.res, cqe.flags);
-            head = head.wrapping_add(1);
+            let next = head.wrapping_add(1);
             // Free the CQ slot before processing: completing an op can
             // resubmit (partial write) and in the worst case flush into EBUSY
-            // handling, which drains this ring reentrantly-by-loop.
-            unsafe { &*self.cq_head }.store(head, Ordering::Release);
+            // handling. The reentrancy guard makes a nested drain a no-op.
+            unsafe { &*self.cq_head }.store(next, Ordering::Release);
             self.cqes_harvested += 1;
             self.complete(user_data, res, flags);
         }
+        self.draining = false;
     }
 
     /// Turn one CQE into a completion (or a resubmission, or nothing).
     fn complete(&mut self, id: u64, res: i32, flags: u32) {
-        // Reclaim a kernel-selected buffer first, whatever becomes of the op.
-        // The kernel has already taken it out of the ring, so skipping this on
-        // an ignorable CQE would shrink the ring by one buffer every time —
-        // and a ring that has quietly run dry answers every receive with
-        // -ENOBUFS forever.
-        //
-        // The flag alone decides, never the byte count: the kernel gives back
-        // the buffer it picked even when the receive ended in EOF or an error,
-        // so keying this off `res > 0` leaks one buffer per closed connection.
+        if id == SENTINEL {
+            return; // an ASYNC_CANCEL's own result: not interesting
+        }
+        let Some(mut flight) = self.ops.take_op(id) else {
+            // Stale or duplicated CQE: generation says ignore. In particular,
+            // do not reclaim its buffer id: that slot may already have been
+            // republished to the kernel for a later receive.
+            return;
+        };
+        let user = self.ops.user(id);
+
+        // Reclaim a kernel-selected buffer only after the generation-tagged op
+        // has been validated. The flag alone decides, never the byte count: the
+        // kernel gives back its selected buffer even on EOF or error.
         let selected = if flags & IORING_CQE_F_BUFFER != 0 {
             let bid = (flags >> IORING_CQE_BUFFER_SHIFT) as u16;
             let n = res.max(0) as usize;
@@ -1554,21 +1701,6 @@ impl UringDriver {
         } else {
             None
         };
-        if id == SENTINEL {
-            if let Some(buf) = selected {
-                pool::put(&mut self.pool, buf);
-            }
-            return; // an ASYNC_CANCEL's own result: not interesting
-        }
-        let Some(mut flight) = self.ops.take_op(id) else {
-            // Stale or duplicated CQE: generation says ignore. The buffer is
-            // still ours to give back.
-            if let Some(buf) = selected {
-                pool::put(&mut self.pool, buf);
-            }
-            return;
-        };
-        let user = self.ops.user(id);
 
         if matches!(flight.kind, Kind::MultishotAccept) {
             if let Some(buf) = selected {
@@ -1637,6 +1769,26 @@ impl UringDriver {
             }
             (other, _) => other,
         };
+
+        if flight.doomed && matches!(flight.kind, Kind::MultishotRecv) {
+            // A multishot arm is not retired until the kernel clears F_MORE.
+            // Keeping the slab cell alive prevents Drop from mistaking an
+            // intermediate delivery for the terminal cancellation CQE.
+            let fd = flight.fd;
+            if let Some(buf) = selected {
+                pool::put(&mut self.pool, buf);
+            }
+            if flags & IORING_CQE_F_MORE != 0 {
+                self.ops.put_op(id, flight);
+            } else {
+                if self.fd_state(fd).ms_arm == Some(id) {
+                    self.fd_state(fd).ms_arm = None;
+                }
+                self.live_arms = self.live_arms.saturating_sub(1);
+                self.ops.release(id);
+            }
+            return;
+        }
 
         if flight.doomed {
             // Close already freed the fd slots; just deliver the contract.
@@ -2055,13 +2207,15 @@ impl UringDriver {
                         self.push_sqe(IORING_OP_ASYNC_CANCEL, -1, doomed, 0, 0, SENTINEL)?;
                     }
                 }
-                // The multishot arm is the driver's, not the caller's: cancel
-                // it and forget the cell. Its trailing CQE finds nothing and is
-                // ignored, exactly like any other stale completion.
+                // The multishot arm is the driver's, not the caller's. Keep its
+                // cell until the terminal CQE clears F_MORE; only then can its
+                // provided buffers be known to be outside the kernel.
                 if let Some(arm) = st.ms_arm {
-                    self.live_arms = self.live_arms.saturating_sub(1);
-                    self.ops.release(arm);
-                    self.push_sqe(IORING_OP_ASYNC_CANCEL, -1, arm, 0, 0, SENTINEL)?;
+                    if let Some(mut flight) = self.ops.take_op(arm) {
+                        flight.doomed = true;
+                        self.ops.put_op(arm, flight);
+                        self.push_sqe(IORING_OP_ASYNC_CANCEL, -1, arm, 0, 0, SENTINEL)?;
+                    }
                 }
                 // Unlike receive buffers, accepted descriptors are installed
                 // into this process. Keep the arm cell until its final CQE so
@@ -2263,6 +2417,7 @@ impl Driver for UringDriver {
 impl Drop for UringDriver {
     fn drop(&mut self) {
         self.shutdown_accept_arms();
+        let quiesced = self.quiesce_inflight();
         for accepted in self.ready_accepted.drain(..) {
             // SAFETY: these Accept completions have not been handed to the
             // caller's output vector, so the driver still owns their fds.
@@ -2277,18 +2432,49 @@ impl Drop for UringDriver {
                 }
             }
         }
-        // Unregister the buffer ring before the fd goes: its backing Vecs are
-        // ours again once the kernel has let go of them.
-        if let Some(mut bufs) = self.bufs.take() {
-            let mut pool = mem::take(&mut self.pool);
-            bufs.shutdown(self.ring, &mut pool);
+
+        // Unregistering proves the provided-buffer group no longer references
+        // its descriptor mapping. The backing allocations still remain alive
+        // until after the ring fd is closed below.
+        let bufs_unregistered = quiesced
+            && self
+                .bufs
+                .as_ref()
+                .is_none_or(|bufs| bufs.unregister(self.ring));
+
+        // Closing the ring precedes every buffer release. Even after bounded
+        // cancellation, this ordering is the final ownership barrier.
+        // SAFETY: the ring fd belongs exclusively to this driver.
+        unsafe { libc::close(self.ring) };
+
+        if quiesced {
+            if let Some(mut bufs) = self.bufs.take() {
+                if bufs_unregistered {
+                    bufs.release(&mut self.pool);
+                } else {
+                    // Registration teardown failed unexpectedly. Keeping the
+                    // mapping and its backing Vecs alive is safer than guessing
+                    // whether the kernel retained a reference.
+                    mem::forget(bufs);
+                }
+            }
+        } else {
+            // A broken or overloaded kernel did not retire every request inside
+            // the bounded drain. Closing stops new work; leaking all possibly
+            // referenced allocations prevents a teardown UAF.
+            if let Some(bufs) = self.bufs.take() {
+                mem::forget(bufs);
+            }
+            let ops = mem::replace(&mut self.ops, Slab::new());
+            mem::forget(ops);
+            return;
         }
-        // SAFETY: mappings and the ring fd are exclusively ours; the kernel
-        // tears down in-flight ops when the ring closes.
+
+        // SAFETY: every kernel request is retired, the ring fd is closed, and
+        // these mappings are exclusively ours.
         unsafe {
             libc::munmap(self.sqes as *mut libc::c_void, self.sqes_len);
             libc::munmap(self.sq_mmap as *mut libc::c_void, self.sq_mmap_len);
-            libc::close(self.ring);
         }
     }
 }
@@ -2535,6 +2721,100 @@ mod tests {
                 .raw_os_error(),
             Some(libc::ECANCELED)
         );
+    }
+
+    #[test]
+    fn nested_cq_drain_does_not_replay_entries() {
+        let mut d = UringDriver::new().expect("ring");
+        let head = unsafe { &*d.cq_head }.load(Ordering::Relaxed);
+        let idx = (head & d.cq_mask) as usize;
+        // Install one synthetic internal completion. A nested drain must leave
+        // it untouched; the outer drain then consumes it exactly once.
+        // SAFETY: this fresh driver has no submitted work, and idx names a live
+        // CQ cell in its mapping.
+        unsafe {
+            (d.cqes as *mut Cqe).add(idx).write(Cqe {
+                user_data: SENTINEL,
+                res: 0,
+                flags: 0,
+            });
+            (*d.cq_tail).store(head.wrapping_add(1), Ordering::Release);
+        }
+
+        d.draining = true;
+        d.drain_cq();
+        assert_eq!(
+            unsafe { &*d.cq_head }.load(Ordering::Relaxed),
+            head,
+            "a reentrant drain must not consume the outer frame's CQE"
+        );
+
+        d.draining = false;
+        d.drain_cq();
+        assert_eq!(
+            unsafe { &*d.cq_head }.load(Ordering::Relaxed),
+            head.wrapping_add(1),
+            "the outer drain consumes the CQE once"
+        );
+    }
+
+    #[test]
+    fn stale_buffer_cqe_cannot_take_a_republished_slot() {
+        let mut d = UringDriver::new().expect("ring");
+        let Some(ring) = d.bufs.as_ref() else {
+            return;
+        };
+        assert!(ring.kernel_owns[0], "slot zero starts published");
+        let reclaimed = d.ring_buffers_reclaimed;
+
+        d.complete(
+            0xFFFF_FFFF_FFFF_FFFEu64,
+            1,
+            IORING_CQE_F_BUFFER | (0 << IORING_CQE_BUFFER_SHIFT),
+        );
+
+        assert_eq!(d.ring_buffers_reclaimed, reclaimed);
+        assert!(
+            d.bufs.as_ref().expect("buffer ring").kernel_owns[0],
+            "a stale CQE must leave the live kernel-owned allocation alone"
+        );
+        let mut pool = Vec::new();
+        assert!(
+            d.bufs
+                .as_mut()
+                .expect("buffer ring")
+                .take(RING_BUFS, 1, &mut pool)
+                .is_none(),
+            "an out-of-range kernel bid must be ignored, not indexed"
+        );
+    }
+
+    #[test]
+    fn dropping_with_live_io_quiesces_before_buffers_are_freed() {
+        for flush_first in [false, true] {
+            let (peer, server) = UnixStream::pair().expect("socket pair");
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            server.set_nonblocking(true).expect("nonblocking server");
+            let fd = server.into_raw_fd();
+            let mut d = UringDriver::new().expect("ring");
+
+            d.submit(Op::ReadPooled { fd }).expect("pooled read");
+            d.submit(Op::Write {
+                fd,
+                buf: vec![0xA5; 2 * 1024 * 1024],
+            })
+            .expect("large write");
+            if flush_first {
+                d.flush().expect("submit live requests");
+            }
+
+            drop(d);
+            // The descriptor remains caller-owned; close it only after driver
+            // teardown has proved the kernel no longer references its buffers.
+            // SAFETY: `fd` came from into_raw_fd and has not been closed.
+            unsafe { libc::close(fd) };
+            drop(peer);
+        }
     }
 
     /// A read that arms multishot, then meets EOF, then reads again: the second

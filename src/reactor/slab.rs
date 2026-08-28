@@ -142,4 +142,19 @@ impl<T> Slab<T> {
     pub(crate) fn live(&self) -> usize {
         self.live
     }
+
+    /// IDs whose cells currently contain an operation.
+    ///
+    /// The io_uring backend uses a snapshot during shutdown so it can cancel
+    /// every kernel-facing request before any buffer owned by those requests
+    /// is dropped. Reserved-but-empty cells are deliberately excluded: they
+    /// do not name a request the kernel can still access.
+    #[allow(dead_code, reason = "used by the io_uring backend")]
+    pub(crate) fn occupied_ids(&self) -> Vec<OpId> {
+        self.cells
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, cell)| cell.op.as_ref().map(|_| make_id(cell.generation, slot)))
+            .collect()
+    }
 }
