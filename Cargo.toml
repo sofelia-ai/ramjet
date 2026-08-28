@@ -20,6 +20,7 @@ libc = "0.2"
 # src/ may depend on ramjet-ws, and ramjet-ws depends on nothing at all.
 [dev-dependencies]
 ramjet-ws = { path = "ramjet-ws" }
+ramjet-http = { path = "ramjet-http" }
 # TLS for the wss_echo example only. `ring` rather than the default aws-lc-rs so
 # the examples build without a C toolchain, and no tls12: the point is a modern
 # handshake, and dropping it removes a pile of cipher-suite surface. Nothing
@@ -28,7 +29,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 rustls-pemfile = "2"
 
 [workspace]
-members = [".", "ramjet-ws"]
+members = [".", "ramjet-ws", "ramjet-http"]
 
 # Opt-in production profile for the latency/throughput binaries. Keeping this
 # separate from `release` preserves fast iteration while giving deployed

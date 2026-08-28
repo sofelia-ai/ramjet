@@ -1,0 +1,13 @@
+[package]
+name = "ramjet-http"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Sans-io HTTP/1.1 server codec: request parser and response encoder. No runtime, no I/O, no dependencies."
+repository = "https://github.com/sofelia-ai/ramjet"
+keywords = ["http", "sans-io", "codec", "parser"]
+categories = ["network-programming", "parser-implementations"]
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]

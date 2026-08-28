@@ -52,10 +52,15 @@ name = "ramjet"
 version = "0.1.3"
 dependencies = [
  "libc",
+ "ramjet-http",
  "ramjet-ws",
  "rustls",
  "rustls-pemfile",
 ]
+
+[[package]]
+name = "ramjet-http"
+version = "0.1.0"
 
 [[package]]
 name = "ramjet-ws"
