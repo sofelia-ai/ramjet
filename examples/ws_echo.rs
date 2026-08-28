@@ -23,6 +23,7 @@ use ramjet_ws::{Decoder, Event, MessageKind, encode, handshake};
 /// sit above that to echo them rather than refuse them. It still exists: a peer
 /// claiming more than this gets a 1009 instead of an allocation.
 const MAX_MESSAGE: usize = 32 * 1024 * 1024;
+const ACCEPT_RESOURCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// What to send when the opening request is not a WebSocket upgrade at all.
 const BAD_REQUEST: &[u8] =
@@ -326,6 +327,7 @@ fn serve(listener: RawFd) -> io::Result<()> {
         if done.is_empty() {
             return Ok(()); // nothing in flight; waiting again would just spin
         }
+        let mut retry_accept_with_backoff = false;
         for c in done.drain(..) {
             match tag_kind(c.user) {
                 KIND_ACCEPT => match c.result {
@@ -347,6 +349,14 @@ fn serve(listener: RawFd) -> io::Result<()> {
                         ) =>
                     {
                         d.submit_with(Op::Accept { fd: listener }, tag(KIND_ACCEPT, listener))?;
+                    }
+                    Err(ref e)
+                        if matches!(
+                            e.raw_os_error(),
+                            Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+                        ) =>
+                    {
+                        retry_accept_with_backoff = true;
                     }
                     // Anything else means the listener itself is unusable and
                     // will fail the same way forever: fail loudly, not in a spin.
@@ -449,6 +459,10 @@ fn serve(listener: RawFd) -> io::Result<()> {
                 // A Close completion: the descriptor is already gone.
                 _ => {}
             }
+        }
+        if retry_accept_with_backoff {
+            std::thread::sleep(ACCEPT_RESOURCE_BACKOFF);
+            d.submit_with(Op::Accept { fd: listener }, tag(KIND_ACCEPT, listener))?;
         }
     }
 }

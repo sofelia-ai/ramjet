@@ -28,6 +28,7 @@ const FRAME: usize = 4;
 
 /// More workers than this stops helping on the machines this targets.
 const MAX_WORKERS: usize = 8;
+const ACCEPT_RESOURCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn main() -> io::Result<()> {
     let (port, workers) = parse_args();
@@ -93,6 +94,7 @@ fn accept_loop(listener: RawFd, channels: &mut [UnixStream]) -> io::Result<()> {
         if done.is_empty() {
             return Ok(()); // nothing in flight; waiting again would just spin
         }
+        let mut retry_accept_with_backoff = false;
         for c in done.drain(..) {
             if c.id != accept {
                 continue; // Close completions and the like carry no work
@@ -116,10 +118,22 @@ fn accept_loop(listener: RawFd, channels: &mut [UnixStream]) -> io::Result<()> {
                 {
                     accept = d.submit(Op::Accept { fd: listener })?;
                 }
+                Err(ref e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+                    ) =>
+                {
+                    retry_accept_with_backoff = true;
+                }
                 // Anything else means the listener itself is unusable, and it
                 // will fail identically forever: fail loudly rather than spin.
                 Err(e) => return Err(e),
             }
+        }
+        if retry_accept_with_backoff {
+            thread::sleep(ACCEPT_RESOURCE_BACKOFF);
+            accept = d.submit(Op::Accept { fd: listener })?;
         }
     }
 }
