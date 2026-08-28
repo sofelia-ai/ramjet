@@ -72,7 +72,8 @@ jobs:
       - name: Build
         run: |
           cargo build --release --target ${{ matrix.target }} \
-            --bins --example echo --example ws_echo --example wss_echo --example echo_mt
+            --bins --example echo --example ws_echo --example wss_echo \
+            --example echo_mt --example http_hello --example http_mt
 
       - name: Package
         run: |
@@ -82,7 +83,8 @@ jobs:
           B="target/${{ matrix.target }}/release"
           cp "$B/connect_bench" "$B/ws_bench" "$DIR/"
           cp "$B/examples/echo" "$B/examples/ws_echo" \
-             "$B/examples/wss_echo" "$B/examples/echo_mt" "$DIR/"
+             "$B/examples/wss_echo" "$B/examples/echo_mt" \
+             "$B/examples/http_hello" "$B/examples/http_mt" "$DIR/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$DIR/"
           tar czf "$DIR.tar.gz" "$DIR"
           shasum -a 256 "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
